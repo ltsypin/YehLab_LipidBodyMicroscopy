@@ -57,22 +57,35 @@ detected from the images).
 
 ## Environment
 
-Dependencies: `numpy`, `scipy`, `pandas`, `tifffile`, `matplotlib`. Deliberately
-avoided scikit-image/opencv/seaborn — not because they're unsuitable, but
-because they weren't reliably available in the environment this was
-developed in, so classical operations (Otsu threshold, connected components,
-ellipse fitting, convex hull) were hand-implemented on top of
-`scipy.ndimage` / `numpy` / `scipy.spatial.ConvexHull`. A real repo should
-pin these in `environment.yml` or `requirements.txt` and drop the
-workarounds if scikit-image is reliably installable.
+This project has a dedicated conda/mamba environment, `microscopy.env`,
+pinned in `environment.yml`:
 
-**Known gotcha**: the base conda environment used during development had a
-*broken* matplotlib install (its `__init__.py` was missing, so
-`import matplotlib` silently produced a non-functional namespace package).
-All scripts were actually run via a different environment
-(`tgne.env`, e.g. `/Users/lmt/miniconda3/envs/tgne.env/bin/python3`). Before
-reproducing this analysis, verify `python3 -c "import matplotlib; matplotlib.__version__"`
-actually works in whatever environment you use.
+```
+mamba env create -f environment.yml
+mamba activate microscopy.env
+```
+
+Core dependencies (actually imported by the scripts, everything below is
+stdlib otherwise): `numpy`, `scipy`, `pandas`, `tifffile`, `matplotlib`.
+
+`scikit-image` and `bokeh` are also installed for future work, but nothing
+in the pipeline uses them yet. All the classical CV the scripts currently do
+(Otsu threshold, connected components, ellipse fitting, convex hull) was
+hand-implemented on top of `scipy.ndimage` / `numpy` / `scipy.spatial.ConvexHull`
+instead, back when scikit-image wasn't reliably available in the environment
+this was originally developed in (see git history) — now that a real
+scikit-image install exists, revisiting those hand-rolled implementations in
+favor of `skimage.filters.threshold_otsu`, `skimage.measure.regionprops`,
+etc. would be a reasonable simplification, though the two aren't guaranteed
+to produce numerically identical results, so re-validate against the
+QC-reviewed FOVs (see Step 3) before swapping.
+
+**Historical note**: earlier development used a repurposed environment
+(`tgne.env`) from an unrelated project, because the base conda environment's
+matplotlib install was broken (missing `__init__.py`, so `import matplotlib`
+silently produced a non-functional namespace package). `microscopy.env` was
+created fresh and doesn't have that problem — if you ever see that failure
+mode again, it's specific to that one broken environment, not this project.
 
 ## Step 0: Fix known raw-data issues
 
@@ -369,9 +382,6 @@ standalone scripts — worth formalizing before this becomes a "real" repo:
 5. `renamed_composites/` currently holds both the renamed per-FOV TIFFs and
    the composite QC PNGs — consider splitting these into separate
    directories for clarity.
-6. Pin the Python environment (`environment.yml` / `requirements.txt`) and
-   confirm matplotlib actually imports correctly in it (see Environment
-   section above).
 
 ## Quickstart: full pipeline from raw data
 
