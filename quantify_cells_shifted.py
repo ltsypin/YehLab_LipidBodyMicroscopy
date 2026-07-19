@@ -20,6 +20,9 @@ to cell motion/focal-plane differences between sequential channel captures).
 The same correction is applied to BODIPY under the assumption it shares the
 fluorescence path's offset; this is unverified for BODIPY specifically, since
 it has no DIC-visible structural analog.
+
+Use --days/--reps to restrict to specific Day/replicate numbers (same
+behavior as quantify_cells.py's --days/--reps -- see that script's docstring).
 """
 
 import argparse
@@ -36,6 +39,7 @@ import scipy.ndimage as ndi
 from quantify_cells import (
     CHANNELS, segment_dic, accepted_cells, group_fovs,
     count_lipid_bodies, LIPID_SMOOTH_SIGMA, CONDITION_ORDER, make_categorical_plot,
+    parse_int_list, filter_fovs_by_day_rep,
 )
 
 SHIFT_DY, SHIFT_DX = 7, -1
@@ -47,11 +51,18 @@ def main():
     parser.add_argument("output_dir")
     parser.add_argument("--shift-dy", type=float, default=SHIFT_DY)
     parser.add_argument("--shift-dx", type=float, default=SHIFT_DX)
+    parser.add_argument("--days", type=str, default=None,
+                         help="Comma-separated Day numbers to include, e.g. '3' or '1,3' (default: all days present)")
+    parser.add_argument("--reps", type=str, default=None,
+                         help="Comma-separated replicate numbers to include, e.g. '1,2' (default: all reps present)")
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
+    days, reps = parse_int_list(args.days), parse_int_list(args.reps)
     rows = []
-    fovs = group_fovs(args.input_dir)
+    fovs = filter_fovs_by_day_rep(group_fovs(args.input_dir), days=days, reps=reps)
+    if not fovs:
+        raise SystemExit(f"No FOVs matched --days={args.days} --reps={args.reps} in {args.input_dir}")
     for (prefix, fov_num), channel_paths in sorted(fovs.items()):
         missing = [c for c in CHANNELS if c not in channel_paths]
         if missing:

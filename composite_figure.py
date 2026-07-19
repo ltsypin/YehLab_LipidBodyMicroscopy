@@ -17,8 +17,16 @@ Panel layout (2x2):
 Panels are spaced exactly 0.5 mm apart. A white 65 px (10 um) scale bar with
 a "10 um" label is drawn in panel a.
 
+Use --days/--reps to restrict to specific Day/replicate numbers, parsed from
+the "<Condition>_Day<N>_rep<M>" filename prefix (e.g. --days 3 --reps 1,2).
+This restricts BOTH which composite figures get rendered AND which images
+feed the global per-channel min/max used for normalization -- i.e. a
+filtered run is a fully self-contained analysis of that subset, with its own
+normalization baseline, not a partial regeneration against a full-dataset
+baseline computed elsewhere.
+
 Usage:
-    python composite_figure.py <input_dir> <output_dir>
+    python composite_figure.py <input_dir> <output_dir> [--days 3] [--reps 1,2]
 """
 
 import argparse
@@ -38,6 +46,7 @@ from matplotlib.patches import Rectangle
 
 CHANNELS = ["DIC", "Chlorophyll", "BODIPY"]
 FOV_FILE_RE = re.compile(r"^(?P<prefix>.+?)FOV(?P<fov>\d+)_(?P<channel>DIC|Chlorophyll|BODIPY)\.tiff$")
+PREFIX_DAY_REP_RE = re.compile(r"_Day(?P<day>\d+)_rep(?P<rep>\d+)$")
 
 MM_PER_INCH = 25.4
 PANEL_GAP_MM = 0.5
@@ -45,12 +54,36 @@ SCALE_BAR_PX = 65
 SCALE_BAR_UM = 10
 
 
-def find_channel_files(directory):
+def parse_day_rep(prefix):
+    """Extract (day, rep) ints from a '<Condition>_Day<N>_rep<M>' prefix; (None, None) if it doesn't match."""
+    match = PREFIX_DAY_REP_RE.search(prefix)
+    if not match:
+        return None, None
+    return int(match.group("day")), int(match.group("rep"))
+
+
+def parse_int_list(value):
+    """Parse a CLI value like '1,3' into [1, 3]; None stays None (meaning "no filter")."""
+    if value is None:
+        return None
+    return [int(v) for v in value.split(",") if v.strip()]
+
+
+def matches_day_rep(prefix, days, reps):
+    day, rep = parse_day_rep(prefix)
+    if days is not None and day not in days:
+        return False
+    if reps is not None and rep not in reps:
+        return False
+    return True
+
+
+def find_channel_files(directory, days=None, reps=None):
     """Map channel name -> list of file paths for every image of that channel."""
     files_by_channel = defaultdict(list)
     for path in glob.glob(os.path.join(directory, "*.tiff")):
         match = FOV_FILE_RE.match(os.path.basename(path))
-        if match:
+        if match and matches_day_rep(match.group("prefix"), days, reps):
             files_by_channel[match.group("channel")].append(path)
     return files_by_channel
 
@@ -68,12 +101,12 @@ def compute_global_ranges(files_by_channel):
     return ranges
 
 
-def group_fovs(directory):
+def group_fovs(directory, days=None, reps=None):
     """Map (prefix, fov_number) -> {channel: path}."""
     fovs = defaultdict(dict)
     for path in glob.glob(os.path.join(directory, "*.tiff")):
         match = FOV_FILE_RE.match(os.path.basename(path))
-        if match:
+        if match and matches_day_rep(match.group("prefix"), days, reps):
             key = (match.group("prefix"), int(match.group("fov")))
             fovs[key][match.group("channel")] = path
     return fovs
@@ -167,21 +200,26 @@ def main():
     parser.add_argument("output_dir", help="Directory to write *_quantitative_composite.png files")
     parser.add_argument("--panel-size-in", type=float, default=3.0, help="Width of each panel, in inches")
     parser.add_argument("--dpi", type=int, default=300)
+    parser.add_argument("--days", type=str, default=None,
+                         help="Comma-separated Day numbers to include, e.g. '3' or '1,3' (default: all days present)")
+    parser.add_argument("--reps", type=str, default=None,
+                         help="Comma-separated replicate numbers to include, e.g. '1,2' (default: all reps present)")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
+    days, reps = parse_int_list(args.days), parse_int_list(args.reps)
 
-    files_by_channel = find_channel_files(args.input_dir)
+    files_by_channel = find_channel_files(args.input_dir, days=days, reps=reps)
     missing = [c for c in CHANNELS if c not in files_by_channel]
     if missing:
-        raise SystemExit(f"No files found for channel(s): {missing}")
+        raise SystemExit(f"No files found for channel(s): {missing} (--days={args.days} --reps={args.reps})")
 
     print("Computing global intensity ranges per channel...")
     ranges = compute_global_ranges(files_by_channel)
     for channel, (vmin, vmax) in ranges.items():
         print(f"  {channel}: min={vmin}, max={vmax}")
 
-    fovs = group_fovs(args.input_dir)
+    fovs = group_fovs(args.input_dir, days=days, reps=reps)
     for (prefix, fov_num), channel_paths in sorted(fovs.items()):
         missing_channels = [c for c in CHANNELS if c not in channel_paths]
         if missing_channels:

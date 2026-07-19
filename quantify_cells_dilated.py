@@ -12,6 +12,9 @@ per-cell motion or focal-plane differences add noise anyway), this expands
 the mask by a fixed radius so that shifted signal near the cell is still
 captured. Segmentation/morphology filtering is unchanged; only the pixels
 summed for fluorescence differ.
+
+Use --days/--reps to restrict to specific Day/replicate numbers (same
+behavior as quantify_cells.py's --days/--reps -- see that script's docstring).
 """
 
 import argparse
@@ -28,6 +31,7 @@ import scipy.ndimage as ndi
 from quantify_cells import (
     CHANNELS, segment_dic, accepted_cells, group_fovs, disk,
     count_lipid_bodies, LIPID_SMOOTH_SIGMA, CONDITION_ORDER, make_categorical_plot,
+    parse_int_list, filter_fovs_by_day_rep,
 )
 
 DILATE_RADIUS_PX = 15
@@ -38,12 +42,19 @@ def main():
     parser.add_argument("input_dir")
     parser.add_argument("output_dir")
     parser.add_argument("--dilate-radius", type=int, default=DILATE_RADIUS_PX)
+    parser.add_argument("--days", type=str, default=None,
+                         help="Comma-separated Day numbers to include, e.g. '3' or '1,3' (default: all days present)")
+    parser.add_argument("--reps", type=str, default=None,
+                         help="Comma-separated replicate numbers to include, e.g. '1,2' (default: all reps present)")
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     struct = disk(args.dilate_radius)
 
+    days, reps = parse_int_list(args.days), parse_int_list(args.reps)
     rows = []
-    fovs = group_fovs(args.input_dir)
+    fovs = filter_fovs_by_day_rep(group_fovs(args.input_dir), days=days, reps=reps)
+    if not fovs:
+        raise SystemExit(f"No FOVs matched --days={args.days} --reps={args.reps} in {args.input_dir}")
     for (prefix, fov_num), channel_paths in sorted(fovs.items()):
         missing = [c for c in CHANNELS if c not in channel_paths]
         if missing:

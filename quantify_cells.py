@@ -21,8 +21,16 @@ it within each cell mask, and counting connected bright components above a
 minimum size. Droplets that touch or overlap enough to merge into one
 connected component are counted as a single lipid body.
 
+Use --days/--reps to restrict the analysis to specific Day/replicate numbers,
+parsed from the "<Condition>_Day<N>_rep<M>" filename prefix (e.g. to analyze
+only Day 3 replicates 1-2, pass --days 3 --reps 1,2). This changes ONLY which
+FOVs are read -- it has no effect on the segmentation or measurement logic,
+and condition/mean-computation is always over whatever set of FOVs is passed
+in, so filtering to a subset is equivalent to re-running the whole analysis
+on that subset (not a post-hoc filter of a full-dataset result).
+
 Usage:
-    python quantify_cells.py <input_dir> <output_dir>
+    python quantify_cells.py <input_dir> <output_dir> [--days 3] [--reps 1,2]
 """
 
 import argparse
@@ -42,6 +50,7 @@ import matplotlib.pyplot as plt
 
 CHANNELS = ["DIC", "Chlorophyll", "BODIPY"]
 FOV_FILE_RE = re.compile(r"^(?P<prefix>.+?)FOV(?P<fov>\d+)_(?P<channel>DIC|Chlorophyll|BODIPY)\.tiff$")
+PREFIX_DAY_REP_RE = re.compile(r"_Day(?P<day>\d+)_rep(?P<rep>\d+)$")
 
 UM_PER_PX = 10.0 / 65.0  # matches the 65 px = 10 um scale bar used in composite_figure.py
 
@@ -158,6 +167,37 @@ def group_fovs(directory):
     return fovs
 
 
+def parse_day_rep(prefix):
+    """Extract (day, rep) ints from a '<Condition>_Day<N>_rep<M>' prefix; (None, None) if it doesn't match."""
+    match = PREFIX_DAY_REP_RE.search(prefix)
+    if not match:
+        return None, None
+    return int(match.group("day")), int(match.group("rep"))
+
+
+def parse_int_list(value):
+    """Parse a CLI value like '1,3' into [1, 3]; None stays None (meaning "no filter")."""
+    if value is None:
+        return None
+    return [int(v) for v in value.split(",") if v.strip()]
+
+
+def filter_fovs_by_day_rep(fovs, days=None, reps=None):
+    """Keep only (prefix, fov_num) keys whose parsed day/rep are in the given allow-lists (None = no filter)."""
+    if days is None and reps is None:
+        return fovs
+    filtered = {}
+    for key, channel_paths in fovs.items():
+        prefix, _fov_num = key
+        day, rep = parse_day_rep(prefix)
+        if days is not None and day not in days:
+            continue
+        if reps is not None and rep not in reps:
+            continue
+        filtered[key] = channel_paths
+    return filtered
+
+
 def save_qc_overlay(dic_img, cells, out_path):
     fig, ax = plt.subplots(figsize=(8, 6))
     ax.imshow(dic_img, cmap="gray")
@@ -196,6 +236,10 @@ def main():
     parser.add_argument("input_dir", help="Directory of renamed <prefix>FOV<n>_<Channel>.tiff files")
     parser.add_argument("output_dir")
     parser.add_argument("--qc-overlays", action="store_true", help="Save a segmentation overlay PNG per FOV")
+    parser.add_argument("--days", type=str, default=None,
+                         help="Comma-separated Day numbers to include, e.g. '3' or '1,3' (default: all days present)")
+    parser.add_argument("--reps", type=str, default=None,
+                         help="Comma-separated replicate numbers to include, e.g. '1,2' (default: all reps present)")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -203,8 +247,11 @@ def main():
     if args.qc_overlays:
         os.makedirs(qc_dir, exist_ok=True)
 
+    days, reps = parse_int_list(args.days), parse_int_list(args.reps)
     rows = []
-    fovs = group_fovs(args.input_dir)
+    fovs = filter_fovs_by_day_rep(group_fovs(args.input_dir), days=days, reps=reps)
+    if not fovs:
+        raise SystemExit(f"No FOVs matched --days={args.days} --reps={args.reps} in {args.input_dir}")
     for (prefix, fov_num), channel_paths in sorted(fovs.items()):
         missing = [c for c in CHANNELS if c not in channel_paths]
         if missing:
