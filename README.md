@@ -2,8 +2,8 @@
 
 Quantifies chlorophyll and BODIPY (lipid droplet) fluorescence, and lipid body
 counts, in *Phaeodactylum tricornutum* cells imaged by DIC + two fluorescence
-channels, across three nitrogen-source conditions (Nitrate, Arginine, Urea),
-Day 3, 3 replicates each. This file documents how to reproduce the analysis
+channels, across three nitrogen-source conditions (Nitrate, Arginine, Urea).
+This file documents how to reproduce the analysis
 end-to-end and, more importantly, *why* each non-obvious choice was made, so
 it can be turned into a proper version-controlled repo.
 
