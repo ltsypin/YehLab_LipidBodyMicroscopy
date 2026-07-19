@@ -37,6 +37,7 @@ composite_figure.py
 quantify_cells.py
 quantify_cells_dilated.py     (rejected approach, kept for reference — see Step 4)
 quantify_cells_shifted.py     (adopted approach — see Step 4)
+qc_review_app.py             (interactive segmentation QC tool — see "QC review tool" below)
 ```
 
 Raw `.liff` files and their derived TIFF exports are grouped into a
@@ -66,19 +67,23 @@ mamba activate microscopy.env
 ```
 
 Core dependencies (actually imported by the scripts, everything below is
-stdlib otherwise): `numpy`, `scipy`, `pandas`, `tifffile`, `matplotlib`.
+stdlib otherwise): `numpy`, `scipy`, `pandas`, `tifffile`, `matplotlib`,
+`bokeh` and `scikit-image` (the last two used only by `qc_review_app.py`,
+see below — `scikit-image` there just for `skimage.measure.find_contours`,
+to draw cell mask boundaries).
 
-`scikit-image` and `bokeh` are also installed for future work, but nothing
-in the pipeline uses them yet. All the classical CV the scripts currently do
-(Otsu threshold, connected components, ellipse fitting, convex hull) was
-hand-implemented on top of `scipy.ndimage` / `numpy` / `scipy.spatial.ConvexHull`
-instead, back when scikit-image wasn't reliably available in the environment
-this was originally developed in (see git history) — now that a real
-scikit-image install exists, revisiting those hand-rolled implementations in
-favor of `skimage.filters.threshold_otsu`, `skimage.measure.regionprops`,
-etc. would be a reasonable simplification, though the two aren't guaranteed
-to produce numerically identical results, so re-validate against the
-QC-reviewed FOVs (see Step 3) before swapping.
+None of the core pipeline scripts (`quantify_cells.py` etc.) use
+scikit-image yet. All the classical CV they currently do (Otsu threshold,
+connected components, ellipse fitting, convex hull) was hand-implemented on
+top of `scipy.ndimage` / `numpy` / `scipy.spatial.ConvexHull` instead, back
+when scikit-image wasn't reliably available in the environment this was
+originally developed in (see git history) — now that a real scikit-image
+install exists, revisiting those hand-rolled implementations in favor of
+`skimage.filters.threshold_otsu`, `skimage.measure.regionprops`, etc. would
+be a reasonable simplification, though the two aren't guaranteed to produce
+numerically identical results, so re-validate against the QC-reviewed FOVs
+(see Step 3) before swapping. (This has since been done on the `b-scikit`
+branch.)
 
 **Historical note**: earlier development used a repurposed environment
 (`tgne.env`) from an unrelated project, because the base conda environment's
@@ -225,6 +230,35 @@ Default plot: `lipid_bodies_per_cell.png` (categorical scatter, one point per
 cell, x = condition in order `[Nitrate, Arginine, Urea]`, black bar = mean).
 Average/total-intensity plots are *not* produced by this script's `main()` by
 default — see Step 5.
+
+### QC review tool (`qc_review_app.py`)
+
+`--qc-overlays` PNGs are useful but static and one-per-FOV; `qc_review_app.py`
+is an interactive Bokeh server app for browsing the whole dataset's
+segmentation FOV-by-FOV and flagging specific cells as poorly segmented, to
+build up a concrete list of failure cases (e.g. for choosing/validating
+automated-test fixtures, see the open items below).
+
+```
+bokeh serve --show qc_review_app.py --args <input_dir> [<output_dir>]
+```
+
+(defaults to `renamed_composites`/`quantification` if omitted). Panels
+a-d are the same DIC/Chlorophyll/BODIPY/overlay composite as
+`composite_figure.py`, using the same global per-channel normalization
+(computed once over `<input_dir>`, reusing `composite_figure.py`'s own
+functions directly — not a re-implementation). Panel e is DIC with every
+accepted cell's mask boundary (from `skimage.measure.find_contours` on the
+exact same tight mask `quantify_cells.py` measures) drawn as a clickable
+region: click a cell to flag it red (poor segmentation), click again to
+unflag. Flags persist as you navigate between FOVs via the Previous/Next
+buttons or the FOV dropdown. **Export flagged ROIs** writes every currently
+flagged cell (sample, FOV, cell ID, and its full `quantify_cells.py`
+measurement row) to `<output_dir>/flagged_rois.csv`.
+
+This tool calls `quantify_cells.segment_dic`/`accepted_cells`/
+`count_lipid_bodies` directly, so what it shows is exactly what ends up in
+`cell_measurements.csv` — not an approximation of it.
 
 ## Step 4: Fluorescence-to-DIC registration correction
 
