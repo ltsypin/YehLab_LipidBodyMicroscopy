@@ -169,7 +169,7 @@ ASPECT = SAMPLE_HEIGHT / SAMPLE_WIDTH
 
 SMALL_W = 300
 SMALL_H = int(SMALL_W * ASPECT)
-LARGE_W = 520
+LARGE_W = 2 * SMALL_W
 LARGE_H = int(LARGE_W * ASPECT)
 
 
@@ -504,8 +504,9 @@ layout = column(
     instructions,
     row(prev_button, next_button, fov_select),
     status_div,
-    row(dic_fig, chl_fig, bod_fig),
-    row(overlay_fig, seg_fig),
+    row(dic_fig, chl_fig),
+    row(bod_fig, overlay_fig),
+    row(seg_fig),
     row(reg_fig),
     row(export_button, export_status_div),
     flagged_div,
