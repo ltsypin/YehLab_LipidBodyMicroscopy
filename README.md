@@ -27,7 +27,9 @@ not a partial regeneration against a baseline computed elsewhere.
 ## Directory layout
 
 ```
-tiffs/                    raw microscope exports (read-only, never modified)
+<YYYYMMDD>_Day<N>/        one folder per acquisition date + Day number
+  tiffs/                  raw microscope exports for that date+Day (read-only, never modified)
+*.liff                    raw acquisition files (not yet grouped into date folders — see note below)
 renamed_composites/       renamed per-FOV TIFFs + composite QC figures (Steps 1-2)
 quantification/           per-cell measurements + plots (Steps 3-5)
 rename_microscopy_images.py
@@ -37,7 +39,18 @@ quantify_cells_dilated.py     (rejected approach, kept for reference — see Ste
 quantify_cells_shifted.py     (adopted approach — see Step 4)
 ```
 
-Raw data convention: each sample directory/prefix is named
+Raw TIFF exports are grouped into a `<YYYYMMDD>_Day<N>/tiffs/` folder per
+acquisition session, where `YYYYMMDD` is the `.liff` files' creation date and
+`Day<N>` is parsed from their filenames (e.g. `20260625_Day3/`, from
+`.liff` files created 2026-06-25, all named `..._Day3_...`). This dataset
+currently has only one such folder since all 9 `.liff` files share one
+creation date and Day number; expect more as additional acquisition sessions
+are added. **Note**: the raw `.liff` files themselves currently still sit at
+the repo root, ungrouped — only the derived `tiffs/` exports were moved into
+the dated folders. Group the `.liff` files the same way too if/when that's
+needed.
+
+Raw data convention within each `tiffs/` folder: each sample prefix is named
 `<Condition>_Day<N>_rep<M>`, and contains one TIFF per z-layer named
 `<prefix>captured layer <X>.tiff`, plus one unused `<prefix>Original Image.tiff`.
 Every 3 consecutive layer numbers are one field of view (FOV): the 1st is
@@ -356,19 +369,23 @@ standalone scripts — worth formalizing before this becomes a "real" repo:
    `segment_dic`/`accepted_cells`/`count_lipid_bodies` against a couple of
    the QC-reviewed FOVs so future refactors don't silently change accepted
    cell counts or measurements.
-5. `renamed_composites/` currently holds both the renamed per-FOV TIFFs and
+5. The raw `.liff` files still sit at the repo root, not grouped into
+   `<YYYYMMDD>_Day<N>/` folders like their derived `tiffs/` exports are — do
+   that too if/when it matters (e.g. once a second acquisition session
+   exists and the root gets cluttered).
+6. `renamed_composites/` currently holds both the renamed per-FOV TIFFs and
    the composite QC PNGs — consider splitting these into separate
    directories for clarity.
-6. Pin the Python environment (`environment.yml` / `requirements.txt`) and
+7. Pin the Python environment (`environment.yml` / `requirements.txt`) and
    confirm matplotlib actually imports correctly in it (see Environment
    section above).
 
 ## Quickstart: full pipeline from raw data
 
 ```bash
-# 0. Copy raw captured-layer files into a working directory (never modify tiffs/ directly)
+# 0. Copy raw captured-layer files into a working directory (never modify <date>_Day<N>/tiffs/ directly)
 mkdir renamed_composites
-cp tiffs/*"captured layer"*.tiff renamed_composites/
+cp 20260625_Day3/tiffs/*"captured layer"*.tiff renamed_composites/
 
 # 1. Rename into FOV-grouped, channel-labeled files (check for divisible-by-3 warnings!)
 python rename_microscopy_images.py renamed_composites
