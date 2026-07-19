@@ -243,11 +243,18 @@ automated-test fixtures, see the open items below).
 bokeh serve --show qc_review_app.py --args <input_dir> [<output_dir>]
 ```
 
-(defaults to `renamed_composites`/`quantification` if omitted). Panels
-a-d are the same DIC/Chlorophyll/BODIPY/overlay composite as
-`composite_figure.py`, using the same global per-channel normalization
-(computed once over `<input_dir>`, reusing `composite_figure.py`'s own
-functions directly — not a re-implementation).
+(defaults to `renamed_composites`/`quantification` if omitted). The whole
+grid is responsive to the browser window width; panels e/f are always
+exactly 2x the width of the a-d row, at any window size. Panels a-d are
+deliberately small — they share one row, and rely on panels e/f (plus
+Bokeh's own pan/zoom tools) for detailed inspection — but are otherwise the
+same DIC/Chlorophyll/BODIPY/overlay composite as `composite_figure.py`,
+using the same global per-channel normalization (computed once over
+`<input_dir>`, reusing `composite_figure.py`'s own functions directly — not
+a re-implementation). Panels d and f (the two Chlorophyll+BODIPY overlays,
+raw and registration-corrected) carry the same white 65 px = 10 µm scale
+bar as `composite_figure.py` (`SCALE_BAR_PX`/`SCALE_BAR_UM`, imported
+directly from it).
 
 - **Panel e** is DIC with every accepted cell's mask boundary (from
   `skimage.measure.find_contours` on the exact same tight mask

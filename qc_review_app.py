@@ -45,7 +45,10 @@ from quantify_cells import (
     CHANNELS, segment_dic, accepted_cells, count_lipid_bodies, LIPID_SMOOTH_SIGMA,
 )
 from quantify_cells_shifted import SHIFT_DY, SHIFT_DX
-from composite_figure import find_channel_files, compute_global_ranges, normalize, to_rgb, group_fovs
+from composite_figure import (
+    find_channel_files, compute_global_ranges, normalize, to_rgb, group_fovs,
+    SCALE_BAR_PX, SCALE_BAR_UM,
+)
 
 from bokeh.io import curdoc
 from bokeh.layouts import column, row
@@ -168,10 +171,27 @@ def to_rgba_uint32(rgb):
 SAMPLE_HEIGHT, SAMPLE_WIDTH = tifffile.imread(fov_items[0][1]["DIC"]).shape
 ASPECT = SAMPLE_HEIGHT / SAMPLE_WIDTH
 
-SMALL_W = 300
-SMALL_H = int(SMALL_W * ASPECT)
-LARGE_W = 2 * SMALL_W
+LARGE_W = 600
 LARGE_H = int(LARGE_W * ASPECT)
+SMALL_W = LARGE_W // 4
+SMALL_H = int(SMALL_W * ASPECT)
+
+
+def add_scale_bar(fig, width, height):
+    """White SCALE_BAR_PX = SCALE_BAR_UM um scale bar, bottom-right, matching composite_figure.py's."""
+    margin = 0.03 * width
+    bar_height = max(2, round(0.006 * height))
+    x0 = width - margin - SCALE_BAR_PX
+    y0 = margin
+    fig.quad(
+        left=[x0], right=[x0 + SCALE_BAR_PX], bottom=[y0], top=[y0 + bar_height],
+        fill_color="white", line_color="white",
+    )
+    fig.text(
+        x=[x0 + SCALE_BAR_PX], y=[y0 + bar_height * 2.5], text=[f"{SCALE_BAR_UM} µm"],
+        text_color="white", text_align="right", text_baseline="bottom",
+        text_font_size="10pt", text_font_style="bold",
+    )
 
 
 def make_image_figure(title, width, height):
@@ -240,6 +260,10 @@ reg_fig.patches(
     xs="xs", ys="ys", source=cells_src,
     fill_alpha=0, line_color=REG_OUTLINE, line_width=2,
 )
+
+# scale bars on the two Chlorophyll+BODIPY overlay panels (raw and registration-corrected)
+add_scale_bar(overlay_fig, SAMPLE_WIDTH, SAMPLE_HEIGHT)
+add_scale_bar(reg_fig, SAMPLE_WIDTH, SAMPLE_HEIGHT)
 
 # ---------------------------------------------------------------------------
 # Controls
@@ -506,8 +530,7 @@ layout = column(
     instructions,
     row(prev_button, next_button, fov_select),
     status_div,
-    row(dic_fig, chl_fig, sizing_mode="stretch_width"),
-    row(bod_fig, overlay_fig, sizing_mode="stretch_width"),
+    row(dic_fig, chl_fig, bod_fig, overlay_fig, sizing_mode="stretch_width"),
     row(seg_fig, sizing_mode="stretch_width"),
     row(reg_fig, sizing_mode="stretch_width"),
     row(export_button, export_status_div),
