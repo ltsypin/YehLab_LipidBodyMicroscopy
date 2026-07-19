@@ -1,0 +1,17 @@
+# Raw and generated microscopy data — not tracked in git (see ANALYSIS_README.md
+# "Environment" / directory layout section). Too large for a normal git repo;
+# regenerate from tiffs/ via the pipeline scripts, or store separately
+# (shared drive, S3, Git LFS, etc.) if you need this versioned too.
+tiffs/
+renamed_composites/
+quantification/
+*.liff
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor / OS cruft
+.DS_Store
+.claude/
+*.bak
