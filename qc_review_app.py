@@ -65,6 +65,7 @@ REG_OUTLINE = "#FAC775"
 MISSED_FILL, MISSED_LINE = "#F0997B", "#993C1D"
 
 WHITE_STYLE = {"background-color": "white"}
+FULL_WIDTH_TEXT_STYLE = {"background-color": "white", "margin": "0"}
 
 # ---------------------------------------------------------------------------
 # Data loading: reuse the pipeline's own functions so review == what's in the CSVs.
@@ -176,6 +177,7 @@ LARGE_H = int(LARGE_W * ASPECT)
 def make_image_figure(title, width, height):
     fig = figure(
         title=title, width=width, height=height,
+        sizing_mode="scale_width",
         x_range=(0, SAMPLE_WIDTH), y_range=(0, SAMPLE_HEIGHT),
         tools="pan,wheel_zoom,reset", match_aspect=True,
         background_fill_color="white", border_fill_color="white",
@@ -250,7 +252,7 @@ fov_options = [
 fov_select = Select(title="Field of view", options=fov_options, value="0", width=320)
 prev_button = Button(label="< Previous", width=100)
 next_button = Button(label="Next >", width=100)
-status_div = Div(text="", width=700, styles=WHITE_STYLE)
+status_div = Div(text="", sizing_mode="stretch_width", styles=FULL_WIDTH_TEXT_STYLE)
 flagged_div = Div(text="", width=900, styles=WHITE_STYLE)
 export_button = Button(label="Export ROIs", button_type="primary", width=180)
 export_status_div = Div(text="", width=700, styles=WHITE_STYLE)
@@ -498,20 +500,21 @@ instructions = Div(text=(
     "flagged cell or missed-cell box below the panels, then use "
     "<b>Export ROIs</b> to write everything to "
     f"<code>{FLAGGED_CSV}</code> and <code>{MISSED_CSV}</code>.</p>"
-), styles=WHITE_STYLE)
+), sizing_mode="stretch_width", styles=FULL_WIDTH_TEXT_STYLE)
 
 layout = column(
     instructions,
     row(prev_button, next_button, fov_select),
     status_div,
-    row(dic_fig, chl_fig),
-    row(bod_fig, overlay_fig),
-    row(seg_fig),
-    row(reg_fig),
+    row(dic_fig, chl_fig, sizing_mode="stretch_width"),
+    row(bod_fig, overlay_fig, sizing_mode="stretch_width"),
+    row(seg_fig, sizing_mode="stretch_width"),
+    row(reg_fig, sizing_mode="stretch_width"),
     row(export_button, export_status_div),
     flagged_div,
     Div(text="<b>Notes on the current FOV's ROIs</b>", styles=WHITE_STYLE),
     notes_column,
+    sizing_mode="stretch_width",
     styles=dict(WHITE_STYLE, padding="12px"),
 )
 
