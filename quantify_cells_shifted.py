@@ -76,8 +76,8 @@ def main():
         chl_corr = ndi.shift(chl, shift=(args.shift_dy, args.shift_dx), order=1)
         bod_corr = ndi.shift(bod, shift=(args.shift_dy, args.shift_dx), order=1)
 
-        labeled, n_components = segment_dic(dic)
-        cells = list(accepted_cells(labeled, n_components, dic.shape))
+        labeled, _n_components = segment_dic(dic)
+        cells = list(accepted_cells(labeled, dic.shape))
         bod_corr_smooth = ndi.gaussian_filter(bod_corr, sigma=LIPID_SMOOTH_SIGMA)
 
         for cell_id, (ys, xs, props) in enumerate(cells, start=1):

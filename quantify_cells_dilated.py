@@ -65,8 +65,8 @@ def main():
         chl = tifffile.imread(channel_paths["Chlorophyll"]).astype(np.float64)
         bod = tifffile.imread(channel_paths["BODIPY"]).astype(np.float64)
 
-        labeled, n_components = segment_dic(dic)
-        cells = list(accepted_cells(labeled, n_components, dic.shape))
+        labeled, _n_components = segment_dic(dic)
+        cells = list(accepted_cells(labeled, dic.shape))
         bod_smooth = ndi.gaussian_filter(bod, sigma=LIPID_SMOOTH_SIGMA)
 
         for cell_id, (ys, xs, props) in enumerate(cells, start=1):

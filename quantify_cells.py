@@ -5,12 +5,22 @@ per-cell Chlorophyll and BODIPY fluorescence, pooled across all replicates
 and fields of view for each condition.
 
 Segmentation: Sobel gradient magnitude of the DIC image -> Otsu threshold
--> morphological closing (bridges the two faint edge lines of a thin cell
-into a filled body) -> hole filling -> opening (denoise) -> connected
-components. Components are kept only if their fitted ellipse dimensions and
-solidity fall within the expected P. tricornutum fusiform morphology; the
-size/aspect-ratio bounds below were calibrated against this dataset (see
-project conversation) rather than taken as fixed biological constants.
+(skimage.filters.threshold_otsu) -> morphological closing (bridges the two
+faint edge lines of a thin cell into a filled body) -> hole filling ->
+opening (denoise) -> connected components (skimage.measure.label). Components
+are kept only if their fitted ellipse dimensions (skimage.measure.regionprops
+axis_major_length/axis_minor_length) and solidity fall within the expected
+P. tricornutum fusiform morphology; the size/aspect-ratio bounds below were
+calibrated against this dataset (see project conversation) rather than taken
+as fixed biological constants.
+
+Solidity is deliberately NOT regionprops' built-in `solidity` property: that
+divides by a *rasterized* convex-hull pixel count, which came out
+systematically ~3-5 percentage points lower than the continuous-polygon-area
+version below in a side-by-side check on this dataset -- enough to flip real
+cells across the calibrated 0.75 threshold. Solidity here still means area /
+(continuous ConvexHull polygon area), just computed from `region.coords`
+instead of a manual np.where loop.
 
 For each accepted cell, "total" fluorescence is the sum of raw pixel
 intensity within the cell mask; "average" is that total divided by the
@@ -44,6 +54,9 @@ import pandas as pd
 import tifffile
 import scipy.ndimage as ndi
 from scipy.spatial import ConvexHull
+from skimage.filters import threshold_otsu
+from skimage.measure import label as sk_label, regionprops
+from skimage.morphology import disk as sk_disk
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -72,56 +85,33 @@ CONDITION_ORDER = ["Nitrate", "Arginine", "Urea"]
 
 
 def disk(radius):
-    y, x = np.ogrid[-radius:radius + 1, -radius:radius + 1]
-    return (x ** 2 + y ** 2) <= radius ** 2
-
-
-def otsu_threshold(values, nbins=256):
-    hist, edges = np.histogram(values, bins=nbins)
-    centers = (edges[:-1] + edges[1:]) / 2
-    hist = hist.astype(np.float64)
-    w1 = np.cumsum(hist)
-    w2 = np.cumsum(hist[::-1])[::-1]
-    m1 = np.cumsum(hist * centers) / np.clip(w1, 1, None)
-    m2 = (np.cumsum((hist * centers)[::-1])[::-1]) / np.clip(w2, 1, None)
-    var_between = w1[:-1] * w2[1:] * (m1[:-1] - m2[1:]) ** 2
-    return centers[np.argmax(var_between)]
+    """Structuring element for the morphological closing/opening below; bit-identical to a
+    hand-rolled `(x**2 + y**2) <= radius**2` mask, checked for radius 2 and 10 on this dataset."""
+    return sk_disk(radius).astype(bool)
 
 
 def segment_dic(dic_img):
     smooth = ndi.gaussian_filter(dic_img.astype(np.float64), sigma=GAUSSIAN_SIGMA)
     grad_mag = np.hypot(ndi.sobel(smooth, axis=1), ndi.sobel(smooth, axis=0))
-    thresh = otsu_threshold(grad_mag.ravel())
+    thresh = threshold_otsu(grad_mag)
     mask = grad_mag > thresh * THRESHOLD_MULT
     mask = ndi.binary_closing(mask, structure=disk(CLOSE_RADIUS_PX))
     mask = ndi.binary_fill_holes(mask)
     mask = ndi.binary_opening(mask, structure=disk(OPEN_RADIUS_PX))
-    return ndi.label(mask)
+    return sk_label(mask, connectivity=1, return_num=True)
 
 
-def fit_ellipse(ys, xs):
-    """Major/minor axis lengths (px) of the ellipse with the same second moments as the region."""
-    dy, dx = ys - ys.mean(), xs - xs.mean()
-    n = len(ys)
-    muyy, muxx, muxy = np.sum(dy * dy) / n, np.sum(dx * dx) / n, np.sum(dy * dx) / n
-    common = np.sqrt((muxx - muyy) ** 2 + 4 * muxy ** 2)
-    l1 = (muxx + muyy + common) / 2
-    l2 = max((muxx + muyy - common) / 2, 0)
-    return 4 * np.sqrt(l1), 4 * np.sqrt(max(l2, 1e-6))
-
-
-def accepted_cells(labeled, n_components, image_shape):
+def accepted_cells(labeled, image_shape):
     """Yield (ys, xs) pixel coordinates for each component that passes the morphology filters."""
     height, width = image_shape
-    for label_id in range(1, n_components + 1):
-        ys, xs = np.where(labeled == label_id)
-        area = len(ys)
-        if area < MIN_COMPONENT_AREA_PX:
+    for region in regionprops(labeled):
+        if region.area < MIN_COMPONENT_AREA_PX:
             continue
-        if ys.min() == 0 or xs.min() == 0 or ys.max() == height - 1 or xs.max() == width - 1:
+        min_row, min_col, max_row, max_col = region.bbox
+        if min_row == 0 or min_col == 0 or max_row == height or max_col == width:
             continue
 
-        major_px, minor_px = fit_ellipse(ys, xs)
+        major_px, minor_px = region.axis_major_length, region.axis_minor_length
         if minor_px <= 0:
             continue
         length_um, width_um = major_px * UM_PER_PX, minor_px * UM_PER_PX
@@ -133,13 +123,14 @@ def accepted_cells(labeled, n_components, image_shape):
         if not (ASPECT_RATIO_RANGE[0] <= aspect_ratio <= ASPECT_RATIO_RANGE[1]):
             continue
 
+        ys, xs = region.coords[:, 0], region.coords[:, 1]
         hull_area = ConvexHull(np.column_stack([xs, ys])).volume
-        solidity = area / hull_area if hull_area > 0 else 0
+        solidity = region.area / hull_area if hull_area > 0 else 0
         if solidity < MIN_SOLIDITY:
             continue
 
         yield ys, xs, dict(
-            area_px=area, length_um=length_um, width_um=width_um,
+            area_px=region.area, length_um=length_um, width_um=width_um,
             aspect_ratio=aspect_ratio, solidity=solidity,
         )
 
@@ -148,13 +139,12 @@ def count_lipid_bodies(bodipy_smooth, ys, xs):
     """Number of distinct BODIPY-bright connected components within a cell mask."""
     cell_mask = np.zeros(bodipy_smooth.shape, dtype=bool)
     cell_mask[ys, xs] = True
-    thresh = otsu_threshold(bodipy_smooth[ys, xs])
+    thresh = threshold_otsu(bodipy_smooth[ys, xs])
     bright_mask = cell_mask & (bodipy_smooth > thresh)
-    labeled, n = ndi.label(bright_mask, structure=np.ones((3, 3)))
+    labeled, n = sk_label(bright_mask, connectivity=2, return_num=True)
     if n == 0:
         return 0
-    sizes = ndi.sum(bright_mask, labeled, index=np.arange(1, n + 1))
-    return int(np.sum(sizes >= LIPID_MIN_SIZE_PX))
+    return sum(1 for region in regionprops(labeled) if region.area >= LIPID_MIN_SIZE_PX)
 
 
 def group_fovs(directory):
@@ -263,8 +253,8 @@ def main():
         chl = tifffile.imread(channel_paths["Chlorophyll"]).astype(np.float64)
         bod = tifffile.imread(channel_paths["BODIPY"]).astype(np.float64)
 
-        labeled, n_components = segment_dic(dic)
-        cells = list(accepted_cells(labeled, n_components, dic.shape))
+        labeled, _n_components = segment_dic(dic)
+        cells = list(accepted_cells(labeled, dic.shape))
         bod_smooth = ndi.gaussian_filter(bod, sigma=LIPID_SMOOTH_SIGMA)
 
         for cell_id, (ys, xs, props) in enumerate(cells, start=1):

@@ -66,19 +66,55 @@ mamba activate microscopy.env
 ```
 
 Core dependencies (actually imported by the scripts, everything below is
-stdlib otherwise): `numpy`, `scipy`, `pandas`, `tifffile`, `matplotlib`.
+stdlib otherwise): `numpy`, `scipy`, `pandas`, `tifffile`, `matplotlib`,
+`scikit-image`. `bokeh` is also installed but still unused.
 
-`scikit-image` and `bokeh` are also installed for future work, but nothing
-in the pipeline uses them yet. All the classical CV the scripts currently do
-(Otsu threshold, connected components, ellipse fitting, convex hull) was
-hand-implemented on top of `scipy.ndimage` / `numpy` / `scipy.spatial.ConvexHull`
-instead, back when scikit-image wasn't reliably available in the environment
-this was originally developed in (see git history) — now that a real
-scikit-image install exists, revisiting those hand-rolled implementations in
-favor of `skimage.filters.threshold_otsu`, `skimage.measure.regionprops`,
-etc. would be a reasonable simplification, though the two aren't guaranteed
-to produce numerically identical results, so re-validate against the
-QC-reviewed FOVs (see Step 3) before swapping.
+**`scikit-image` swap (branch `b-scikit`)**: `quantify_cells.py`'s
+`segment_dic`/`accepted_cells`/`count_lipid_bodies` used to hand-implement
+Otsu thresholding, ellipse fitting via image moments, and connected
+components on top of `scipy.ndimage`/`numpy`, back when scikit-image wasn't
+reliably available in the environment this was originally developed in (see
+git history). That has now been swapped, piece by piece, after validating
+each swap numerically against the hand-rolled version on this dataset's full
+188 accepted cells:
+
+- `skimage.filters.threshold_otsu` in place of the hand-rolled histogram-based
+  Otsu — bit-identical threshold values in testing.
+- `skimage.measure.label` in place of `scipy.ndimage.label` — identical
+  component counts when run on an identical mask (`connectivity=1` matches
+  scipy's default 4-connectivity for `segment_dic`'s cell components;
+  `connectivity=2` matches the `structure=np.ones((3,3))` 8-connectivity
+  `count_lipid_bodies` used for BODIPY-bright components).
+- `region.axis_major_length`/`axis_minor_length` (from
+  `skimage.measure.regionprops`) in place of the hand-rolled moment-based
+  `fit_ellipse` — bit-identical, as expected since `fit_ellipse` was written
+  to match this exact formula.
+- `skimage.morphology.disk` in place of the hand-rolled `(x**2+y**2) <=
+  radius**2` structuring-element mask — bit-identical for the radii this
+  project uses (2, 10, 15).
+
+**Rejected**: `region.solidity` (skimage's built-in solidity property). It
+divides by a *rasterized* convex-hull pixel count, which came out
+systematically ~3-5 percentage points lower than the continuous-polygon-area
+solidity (`scipy.spatial.ConvexHull(...).volume`-based) the hand-rolled code
+used — enough to flip real cells across the calibrated 0.75
+`MIN_SOLIDITY` threshold (one test cell: 0.7583 by the old method, 0.7266 by
+skimage's) and drop 11 of 188 previously-accepted cells in an
+otherwise-identical run. Solidity is still `area / (continuous ConvexHull
+polygon area)`, just computed from `region.coords` instead of a manual
+`np.where` loop, so the 0.75 threshold keeps its originally-calibrated
+meaning. This is exactly the "not guaranteed to produce numerically identical
+results" risk this section used to warn about ahead of time — confirmed in
+practice, not just in theory.
+
+After all of the above, `quantify_cells.py` reproduces the exact same 188
+cells (identical `area_px`/`solidity`/`n_lipid_bodies`, other measurements
+matching to ~1e-13 floating-point noise) and byte-identical
+`--qc-overlays` PNGs as the pre-swap version, including both known
+merged-cell rows (see Step 3). `quantify_cells_dilated.py`/
+`quantify_cells_shifted.py` import `segment_dic`/`accepted_cells`/
+`count_lipid_bodies`/`disk` from `quantify_cells.py` and inherit this change
+with no code changes of their own.
 
 **Historical note**: earlier development used a repurposed environment
 (`tgne.env`) from an unrelated project, because the base conda environment's
@@ -152,14 +188,14 @@ python quantify_cells.py <input_dir> <output_dir> [--qc-overlays] [--days 3] [--
 ### Segmentation (classical CV, DIC channel only)
 
 1. Light Gaussian smoothing (σ=1.0) → Sobel gradient magnitude → Otsu
-   threshold (self-implemented, vectorized histogram method — no
-   scikit-image) × 0.4 → morphological closing (disk radius 10px; bridges
-   the two faint, roughly-parallel edge lines of a thin cell into one filled
-   body) → hole filling → morphological opening (disk radius 2px, denoise) →
-   connected components (`scipy.ndimage.label`).
-2. Each component is fit to an equivalent ellipse via image moments
-   (matching scikit-image's `regionprops` major/minor axis formula) and kept
-   only if:
+   threshold (`skimage.filters.threshold_otsu`) × 0.4 → morphological closing
+   (disk radius 10px; bridges the two faint, roughly-parallel edge lines of a
+   thin cell into one filled body) → hole filling → morphological opening
+   (disk radius 2px, denoise) → connected components
+   (`skimage.measure.label`, 4-connected).
+2. Each component's ellipse dimensions come straight from
+   `skimage.measure.regionprops`'s `axis_major_length`/`axis_minor_length`,
+   and it's kept only if:
    - **length 15–40 µm, width 2–7 µm, aspect ratio 5–16.** These bounds were
      calibrated *empirically against this dataset*, not taken from the
      original stated expectation of 40–60 µm long cells. Measured, cleanly
@@ -168,8 +204,10 @@ python quantify_cells.py <input_dir> <output_dir> [--qc-overlays] [--days 3] [--
      would have rejected essentially every cell. Confirmed with the user
      before narrowing the range — if you get zero or very few detections on
      new data, check this first.
-   - **solidity ≥ 0.75** (mask area / convex hull area), to reject
-     non-convex/branching shapes.
+   - **solidity ≥ 0.75** (mask area / *continuous* convex hull polygon area,
+     via `scipy.spatial.ConvexHull` — deliberately not `regionprops`'
+     built-in `solidity`, see the scikit-image swap note under
+     "Environment"), to reject non-convex/branching shapes.
    - **not touching the image border.**
    - minimum component area 300 px² (drops speckle noise before the
      (relatively expensive) ellipse/hull fitting).
