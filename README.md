@@ -257,6 +257,12 @@ imported directly from it), bottom-right, with the "10 µm" label centered
 over the bar -- except panel d, which shows the bar only, no label
 (`add_scale_bar(..., show_label=False)`).
 
+Panels a-d share one pair of `Range1d` instances, and panels e/f share a
+separate pair, so panning or zooming any one of a-d applies to all four
+(and likewise for e/f) -- panels aren't independently zoomable within
+their own group, by design, since you're always comparing the same FOV
+across channels.
+
 - **Panel e** is DIC with every accepted cell's mask boundary (from
   `skimage.measure.find_contours` on the exact same tight mask
   `quantify_cells.py` measures) drawn as a clickable region: click a cell to

@@ -58,7 +58,7 @@ from bokeh.io import curdoc
 from bokeh.layouts import column, row
 from bokeh.models import (
     ColumnDataSource, Button, Select, Div, HoverTool, TapTool, TextAreaInput, TextInput,
-    FreehandDrawTool,
+    FreehandDrawTool, Range1d,
 )
 from bokeh.plotting import figure
 
@@ -201,11 +201,11 @@ def add_scale_bar(fig, width, height, show_label=True):
         )
 
 
-def make_image_figure(title, width, height):
+def make_image_figure(title, width, height, x_range, y_range):
     fig = figure(
         title=title, width=width, height=height,
         sizing_mode="scale_width",
-        x_range=(0, SAMPLE_WIDTH), y_range=(0, SAMPLE_HEIGHT),
+        x_range=x_range, y_range=y_range,
         tools="pan,wheel_zoom,reset", match_aspect=True,
         background_fill_color="white", border_fill_color="white",
     )
@@ -215,12 +215,24 @@ def make_image_figure(title, width, height):
     return fig
 
 
-dic_fig = make_image_figure("a: DIC", SMALL_W, SMALL_H)
-chl_fig = make_image_figure("b: Chlorophyll", SMALL_W, SMALL_H)
-bod_fig = make_image_figure("c: BODIPY", SMALL_W, SMALL_H)
-overlay_fig = make_image_figure("d: Chlorophyll + BODIPY", SMALL_W, SMALL_H)
-seg_fig = make_image_figure("e: DIC + segmentation (click=flag, drag=lasso missed-cell ROI)", LARGE_W, LARGE_H)
-reg_fig = make_image_figure("f: registration-corrected Chlorophyll+BODIPY + mask outline", LARGE_W, LARGE_H)
+# shared Range1d instances link pan/zoom across a-d and, separately, across e-f
+small_x_range = Range1d(0, SAMPLE_WIDTH)
+small_y_range = Range1d(0, SAMPLE_HEIGHT)
+large_x_range = Range1d(0, SAMPLE_WIDTH)
+large_y_range = Range1d(0, SAMPLE_HEIGHT)
+
+dic_fig = make_image_figure("a: DIC", SMALL_W, SMALL_H, small_x_range, small_y_range)
+chl_fig = make_image_figure("b: Chlorophyll", SMALL_W, SMALL_H, small_x_range, small_y_range)
+bod_fig = make_image_figure("c: BODIPY", SMALL_W, SMALL_H, small_x_range, small_y_range)
+overlay_fig = make_image_figure("d: Chlorophyll + BODIPY", SMALL_W, SMALL_H, small_x_range, small_y_range)
+seg_fig = make_image_figure(
+    "e: DIC + segmentation (click=flag, drag=lasso missed-cell ROI)", LARGE_W, LARGE_H,
+    large_x_range, large_y_range,
+)
+reg_fig = make_image_figure(
+    "f: registration-corrected Chlorophyll+BODIPY + mask outline", LARGE_W, LARGE_H,
+    large_x_range, large_y_range,
+)
 
 dic_src = ColumnDataSource(data=dict(image=[]))
 chl_src = ColumnDataSource(data=dict(image=[]))
