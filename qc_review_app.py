@@ -342,6 +342,19 @@ def _roi_note_callback(i):
     return cb
 
 
+def _remove_roi_callback(i):
+    def cb():
+        xs_list = list(missed_src.data.get("xs", []))
+        ys_list = list(missed_src.data.get("ys", []))
+        notes_list = list(missed_src.data.get("note", []))
+        if i < len(xs_list):
+            del xs_list[i]
+            del ys_list[i]
+            del notes_list[i]
+            missed_src.data = dict(xs=xs_list, ys=ys_list, note=notes_list)
+    return cb
+
+
 def rebuild_notes_panel():
     idx = current_idx[0]
     data = load_fov(idx)
@@ -362,12 +375,14 @@ def rebuild_notes_panel():
     notes_list = missed_src.data.get("note", [])
     for i in range(len(missed_src.data.get("xs", []))):
         ti = TextAreaInput(
-            value=notes_list[i] if i < len(notes_list) else "", rows=2, width=560,
+            value=notes_list[i] if i < len(notes_list) else "", rows=2, width=460,
             title=f"Note -- missed-cell ROI {i + 1} (why should this be a cell?)",
             styles=WHITE_STYLE,
         )
         ti.on_change("value", _roi_note_callback(i))
-        widgets.append(ti)
+        remove_button = Button(label="Remove ROI", button_type="danger", width=100, margin=(24, 0, 0, 10))
+        remove_button.on_click(_remove_roi_callback(i))
+        widgets.append(row(ti, remove_button, styles=WHITE_STYLE))
 
     if not widgets:
         widgets = [Div(text="<i>No flagged cells or missed-cell ROIs on this FOV yet.</i>", styles=WHITE_STYLE)]
@@ -523,7 +538,8 @@ instructions = Div(text=(
     "<p>Panel <b>e</b>: click a cell outline to flag it as poorly segmented "
     "(red = flagged; click again to unflag). Select the <b>Freehand Draw</b> "
     "tool (toolbar icon on panel e) to lasso a good cell the pipeline "
-    "missed; select it (tap) and press Backspace/Delete to remove it. "
+    "missed; drew one poorly? Use the <b>Remove ROI</b> button next to its "
+    "note field below the panels, rather than the tool's own tap-to-select. "
     "Panel <b>f</b> shows the registration-corrected fluorescence with the "
     "same DIC mask outlines, to check the correction is centering signal "
     "inside each cell rather than clipping an edge. Add a note to any "

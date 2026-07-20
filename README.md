@@ -263,11 +263,13 @@ over the bar -- except panel d, which shows the bar only, no label
   flag it red (poor segmentation), click again to unflag. Flags persist as
   you navigate between FOVs via the Previous/Next buttons or the FOV
   dropdown. The same panel's **Freehand Draw** tool (toolbar icon) lets you
-  lasso a good cell the pipeline missed entirely; tap it and press
-  Backspace/Delete to remove it. (An earlier version used the Box Edit tool
-  for rectangular ROIs; it didn't reliably respond to drag gestures in
-  testing, so it was replaced with Freehand Draw, which also traces the
-  actual cell outline instead of a crude bounding box.)
+  lasso a good cell the pipeline missed entirely. (An earlier version used
+  the Box Edit tool for rectangular ROIs; it didn't reliably respond to
+  drag gestures in testing, so it was replaced with Freehand Draw, which
+  also traces the actual cell outline instead of a crude bounding box.)
+  Drew one poorly? Don't rely on the tool's own tap-to-select-then-Backspace
+  gesture -- that wasn't reliable either. Instead use the **Remove ROI**
+  button next to that ROI's note field, below the panels.
 - **Panel f** shows the Step 4 registration-corrected Chlorophyll+BODIPY
   overlay with the same DIC mask outlines on top, so you can visually check
   the correction is actually centering fluorescence signal inside each mask
