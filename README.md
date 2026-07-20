@@ -254,7 +254,8 @@ using the same global per-channel normalization (computed once over
 a re-implementation). Panels e, d, and f each carry the same white 65 px =
 10 µm scale bar as `composite_figure.py` (`SCALE_BAR_PX`/`SCALE_BAR_UM`,
 imported directly from it), bottom-right, with the "10 µm" label centered
-over the bar.
+over the bar -- except panel d, which shows the bar only, no label
+(`add_scale_bar(..., show_label=False)`).
 
 - **Panel e** is DIC with every accepted cell's mask boundary (from
   `skimage.measure.find_contours` on the exact same tight mask
