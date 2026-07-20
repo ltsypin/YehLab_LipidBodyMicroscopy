@@ -13,12 +13,12 @@ overlay with the same (DIC-derived) mask boundaries drawn on top, to check
 that corrected fluorescence signal actually falls inside each outline.
 
 Panel e: click a cell's outline to flag it as poorly segmented (click again
-to unflag); flagged cells turn red. Use the Box Edit tool (toolbar icon) to
-draw a rectangle around a good cell the pipeline missed -- drag to draw,
-click+Backspace/Delete to remove. Both flagged cells and missed-cell boxes
-get a note field below the panels ("why did you select this?"), and "Export
-ROIs" writes everything (with notes) to <output_dir>/flagged_rois.csv and
-<output_dir>/missed_cell_boxes.csv.
+to unflag); flagged cells turn red. Use the Freehand Draw tool (toolbar
+icon) to lasso a good cell the pipeline missed -- drag to trace an outline,
+click+Backspace/Delete to remove it. Both flagged cells and missed-cell
+ROIs get a note field below the panels ("why did you select this?"), and
+"Export ROIs" writes everything (with notes) to <output_dir>/flagged_rois.csv
+and <output_dir>/missed_cell_rois.csv.
 
 Segmentation reuses quantify_cells.segment_dic/accepted_cells/
 count_lipid_bodies verbatim -- this app never re-implements or approximates
@@ -30,6 +30,7 @@ Run:
 Defaults to ./renamed_composites and ./quantification if omitted.
 """
 
+import json
 import os
 import sys
 
@@ -53,14 +54,14 @@ from composite_figure import (
 from bokeh.io import curdoc
 from bokeh.layouts import column, row
 from bokeh.models import (
-    ColumnDataSource, Button, Select, Div, HoverTool, TapTool, TextAreaInput, BoxEditTool,
+    ColumnDataSource, Button, Select, Div, HoverTool, TapTool, TextAreaInput, FreehandDrawTool,
 )
 from bokeh.plotting import figure
 
 INPUT_DIR = sys.argv[1] if len(sys.argv) > 1 else "renamed_composites"
 OUTPUT_DIR = sys.argv[2] if len(sys.argv) > 2 else "quantification"
 FLAGGED_CSV = os.path.join(OUTPUT_DIR, "flagged_rois.csv")
-MISSED_CSV = os.path.join(OUTPUT_DIR, "missed_cell_boxes.csv")
+MISSED_CSV = os.path.join(OUTPUT_DIR, "missed_cell_rois.csv")
 
 FLAGGED_FILL, FLAGGED_LINE = "#E24B4A", "#A32D2D"
 OK_FILL, OK_LINE = "#5DCAA5", "#0F6E56"
@@ -91,8 +92,8 @@ if not fov_items:
 print(f"Found {len(fov_items)} complete FOVs.")
 
 _cache = {}
-flagged_registry = {}       # (prefix, fov_num, cell_id) -> measurement dict (incl. "note")
-missed_boxes_registry = {}  # (prefix, fov_num) -> dict(x=[...], y=[...], width=[...], height=[...], note=[...])
+flagged_registry = {}      # (prefix, fov_num, cell_id) -> measurement dict (incl. "note")
+missed_rois_registry = {}  # (prefix, fov_num) -> dict(xs=[[...], ...], ys=[[...], ...], note=[...])
 
 
 def height_to_bokeh_y(row_coords, height):
@@ -214,7 +215,7 @@ dic_fig = make_image_figure("a: DIC", SMALL_W, SMALL_H)
 chl_fig = make_image_figure("b: Chlorophyll", SMALL_W, SMALL_H)
 bod_fig = make_image_figure("c: BODIPY", SMALL_W, SMALL_H)
 overlay_fig = make_image_figure("d: Chlorophyll + BODIPY", SMALL_W, SMALL_H)
-seg_fig = make_image_figure("e: DIC + segmentation (click=flag, drag=draw missed-cell box)", LARGE_W, LARGE_H)
+seg_fig = make_image_figure("e: DIC + segmentation (click=flag, drag=lasso missed-cell ROI)", LARGE_W, LARGE_H)
 reg_fig = make_image_figure("f: registration-corrected Chlorophyll+BODIPY + mask outline", LARGE_W, LARGE_H)
 
 dic_src = ColumnDataSource(data=dict(image=[]))
@@ -248,14 +249,14 @@ seg_fig.add_tools(HoverTool(renderers=[patches], tooltips=[
     ("lipid bodies", "@n_lipid_bodies"),
 ]))
 
-# manually-drawn "missed good cell" rectangular ROIs, on the same panel
-missed_src = ColumnDataSource(data=dict(x=[], y=[], width=[], height=[], note=[]))
-missed_rect = seg_fig.rect(
-    x="x", y="y", width="width", height="height", source=missed_src,
+# manually-lassoed "missed good cell" ROIs, on the same panel
+missed_src = ColumnDataSource(data=dict(xs=[], ys=[], note=[]))
+missed_patches = seg_fig.patches(
+    xs="xs", ys="ys", source=missed_src,
     fill_alpha=0.25, fill_color=MISSED_FILL, line_color=MISSED_LINE, line_width=2,
 )
-box_edit_tool = BoxEditTool(renderers=[missed_rect], empty_value="")
-seg_fig.add_tools(box_edit_tool)
+freehand_tool = FreehandDrawTool(renderers=[missed_patches], empty_value="")
+seg_fig.add_tools(freehand_tool)
 
 # panel f: same accepted-cell outlines, drawn as an unfilled overlay to check registration
 reg_fig.patches(
@@ -288,10 +289,10 @@ notes_column = column(styles=WHITE_STYLE)
 current_idx = [0]
 
 
-def iter_missed_boxes():
-    for (prefix, fov_num), boxes in missed_boxes_registry.items():
-        notes = boxes.get("note", [])
-        for i in range(len(boxes.get("x", []))):
+def iter_missed_rois():
+    for (prefix, fov_num), rois in missed_rois_registry.items():
+        notes = rois.get("note", [])
+        for i in range(len(rois.get("xs", []))):
             yield prefix, fov_num, i, (notes[i] if i < len(notes) else "")
 
 
@@ -310,15 +311,15 @@ def render_flagged_list():
     else:
         parts.append("<b>Flagged cells:</b> none yet.")
 
-    missed_list = sorted(iter_missed_boxes())
+    missed_list = sorted(iter_missed_rois())
     if missed_list:
         rows = "".join(
-            f"<li>{p}FOV{f} box {i + 1}{', note: ' + note if note else ''}</li>"
+            f"<li>{p}FOV{f} ROI {i + 1}{', note: ' + note if note else ''}</li>"
             for p, f, i, note in missed_list
         )
-        parts.append(f"<b>Missed-cell boxes ({len(missed_list)}):</b><ul>{rows}</ul>")
+        parts.append(f"<b>Missed-cell ROIs ({len(missed_list)}):</b><ul>{rows}</ul>")
     else:
-        parts.append("<b>Missed-cell boxes:</b> none yet.")
+        parts.append("<b>Missed-cell ROIs:</b> none yet.")
 
     flagged_div.text = "".join(parts)
 
@@ -330,7 +331,7 @@ def _cell_note_callback(key):
     return cb
 
 
-def _box_note_callback(i):
+def _roi_note_callback(i):
     def cb(attr, old, new):
         notes = list(missed_src.data.get("note", []))
         if i < len(notes):
@@ -359,29 +360,29 @@ def rebuild_notes_panel():
             widgets.append(ti)
 
     notes_list = missed_src.data.get("note", [])
-    for i in range(len(missed_src.data.get("x", []))):
+    for i in range(len(missed_src.data.get("xs", []))):
         ti = TextAreaInput(
             value=notes_list[i] if i < len(notes_list) else "", rows=2, width=560,
-            title=f"Note -- missed-cell box {i + 1} (why should this be a cell?)",
+            title=f"Note -- missed-cell ROI {i + 1} (why should this be a cell?)",
             styles=WHITE_STYLE,
         )
-        ti.on_change("value", _box_note_callback(i))
+        ti.on_change("value", _roi_note_callback(i))
         widgets.append(ti)
 
     if not widgets:
-        widgets = [Div(text="<i>No flagged cells or missed-cell boxes on this FOV yet.</i>", styles=WHITE_STYLE)]
+        widgets = [Div(text="<i>No flagged cells or missed-cell ROIs on this FOV yet.</i>", styles=WHITE_STYLE)]
     notes_column.children = widgets
 
 
-def save_missed_boxes_for_current_fov():
+def save_missed_rois_for_current_fov():
     idx = current_idx[0]
     data = load_fov(idx)
     key = (data["prefix"], data["fov_num"])
-    missed_boxes_registry[key] = {k: list(v) for k, v in missed_src.data.items()}
+    missed_rois_registry[key] = {k: list(v) for k, v in missed_src.data.items()}
 
 
 def _structural_change(old_data, new_data):
-    for key in ("x", "y", "width", "height"):
+    for key in ("xs", "ys"):
         if list(old_data.get(key, [])) != list(new_data.get(key, [])):
             return True
     return False
@@ -421,8 +422,8 @@ def show_fov(idx):
     )
     cells_src.selected.indices = []
 
-    saved_boxes = missed_boxes_registry.get((prefix, fov_num), dict(x=[], y=[], width=[], height=[], note=[]))
-    missed_src.data = {k: list(v) for k, v in saved_boxes.items()}
+    saved_rois = missed_rois_registry.get((prefix, fov_num), dict(xs=[], ys=[], note=[]))
+    missed_src.data = {k: list(v) for k, v in saved_rois.items()}
 
     status_div.text = (
         f"<b>{prefix}FOV{fov_num}</b> &mdash; FOV {idx + 1} of {len(fov_items)} "
@@ -456,7 +457,7 @@ def on_selected_change(attr, old, new):
 
 
 def on_missed_data_change(attr, old, new):
-    save_missed_boxes_for_current_fov()
+    save_missed_rois_for_current_fov()
     if _structural_change(old, new):
         rebuild_notes_panel()
         render_flagged_list()
@@ -476,7 +477,7 @@ def on_select(attr, old, new):
 
 def on_export():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    n_cells = n_boxes = 0
+    n_cells = n_rois = 0
 
     if flagged_registry:
         rows = [
@@ -486,26 +487,28 @@ def on_export():
         pd.DataFrame(rows).to_csv(FLAGGED_CSV, index=False)
         n_cells = len(rows)
 
-    missed_list = list(iter_missed_boxes())
+    missed_list = list(iter_missed_rois())
     if missed_list:
         rows = []
         for prefix, fov_num, i, note in missed_list:
-            boxes = missed_boxes_registry[(prefix, fov_num)]
-            x, y, w, h = boxes["x"][i], boxes["y"][i], boxes["width"][i], boxes["height"][i]
+            rois = missed_rois_registry[(prefix, fov_num)]
+            xs_i, ys_i = rois["xs"][i], rois["ys"][i]
+            rows_rc = [[round(SAMPLE_HEIGHT - y, 2), round(x, 2)] for x, y in zip(xs_i, ys_i)]
             rows.append(dict(
-                sample=prefix, fov=fov_num, box_index=i + 1,
-                row_min=SAMPLE_HEIGHT - y - h / 2, row_max=SAMPLE_HEIGHT - y + h / 2,
-                col_min=x - w / 2, col_max=x + w / 2, note=note,
+                sample=prefix, fov=fov_num, roi_index=i + 1,
+                row_min=min(r for r, c in rows_rc), row_max=max(r for r, c in rows_rc),
+                col_min=min(c for r, c in rows_rc), col_max=max(c for r, c in rows_rc),
+                polygon_row_col=json.dumps(rows_rc), note=note,
             ))
         pd.DataFrame(rows).to_csv(MISSED_CSV, index=False)
-        n_boxes = len(rows)
+        n_rois = len(rows)
 
-    if n_cells == 0 and n_boxes == 0:
+    if n_cells == 0 and n_rois == 0:
         export_status_div.text = "Nothing flagged or marked yet -- nothing to export."
         return
     export_status_div.text = (
         f"Exported {n_cells} flagged cell(s) to {FLAGGED_CSV} and "
-        f"{n_boxes} missed-cell box(es) to {MISSED_CSV}"
+        f"{n_rois} missed-cell ROI(s) to {MISSED_CSV}"
     )
 
 
@@ -518,13 +521,13 @@ export_button.on_click(on_export)
 
 instructions = Div(text=(
     "<p>Panel <b>e</b>: click a cell outline to flag it as poorly segmented "
-    "(red = flagged; click again to unflag). Select the <b>Box Edit</b> tool "
-    "(toolbar icon on panel e) to drag out a rectangle around a good cell the "
-    "pipeline missed; select a box and press Backspace/Delete to remove it. "
+    "(red = flagged; click again to unflag). Select the <b>Freehand Draw</b> "
+    "tool (toolbar icon on panel e) to lasso a good cell the pipeline "
+    "missed; select it (tap) and press Backspace/Delete to remove it. "
     "Panel <b>f</b> shows the registration-corrected fluorescence with the "
     "same DIC mask outlines, to check the correction is centering signal "
     "inside each cell rather than clipping an edge. Add a note to any "
-    "flagged cell or missed-cell box below the panels, then use "
+    "flagged cell or missed-cell ROI below the panels, then use "
     "<b>Export ROIs</b> to write everything to "
     f"<code>{FLAGGED_CSV}</code> and <code>{MISSED_CSV}</code>.</p>"
 ), sizing_mode="stretch_width", styles=FULL_WIDTH_TEXT_STYLE)

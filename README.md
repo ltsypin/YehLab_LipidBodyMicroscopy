@@ -262,22 +262,26 @@ over the bar -- except panel d, which shows the bar only, no label
   `quantify_cells.py` measures) drawn as a clickable region: click a cell to
   flag it red (poor segmentation), click again to unflag. Flags persist as
   you navigate between FOVs via the Previous/Next buttons or the FOV
-  dropdown. The same panel's **Box Edit** tool (toolbar icon) lets you drag
-  out a rectangle around a good cell the pipeline missed entirely; select a
-  box and press Backspace/Delete to remove it.
+  dropdown. The same panel's **Freehand Draw** tool (toolbar icon) lets you
+  lasso a good cell the pipeline missed entirely; tap it and press
+  Backspace/Delete to remove it. (An earlier version used the Box Edit tool
+  for rectangular ROIs; it didn't reliably respond to drag gestures in
+  testing, so it was replaced with Freehand Draw, which also traces the
+  actual cell outline instead of a crude bounding box.)
 - **Panel f** shows the Step 4 registration-corrected Chlorophyll+BODIPY
   overlay with the same DIC mask outlines on top, so you can visually check
   the correction is actually centering fluorescence signal inside each mask
   rather than clipping an edge, FOV by FOV, instead of trusting the
   aggregate dy/dx estimate alone.
-- Any flagged cell or missed-cell box gets its own note field ("why did you
+- Any flagged cell or missed-cell ROI gets its own note field ("why did you
   select this?") below the panels, so the reasoning survives into the
   exported CSVs, not just an unlabeled coordinate.
 - **Export ROIs** writes every flagged cell (sample, FOV, cell ID, its full
   `quantify_cells.py` measurement row, and its note) to
-  `<output_dir>/flagged_rois.csv`, and every missed-cell box (sample, FOV,
-  box index, pixel bounding box converted back to original image row/col
-  coordinates, and its note) to `<output_dir>/missed_cell_boxes.csv`.
+  `<output_dir>/flagged_rois.csv`, and every missed-cell ROI (sample, FOV,
+  ROI index, its pixel bounding box *and* full polygon converted back to
+  original image row/col coordinates, and its note) to
+  `<output_dir>/missed_cell_rois.csv`.
 
 This tool calls `quantify_cells.segment_dic`/`accepted_cells`/
 `count_lipid_bodies` directly, so what it shows is exactly what ends up in
