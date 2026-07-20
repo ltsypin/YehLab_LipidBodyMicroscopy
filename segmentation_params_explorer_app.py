@@ -22,11 +22,21 @@ Parameters split into two groups for responsiveness:
     moving a filter slider just re-checks that cached geometry against the
     new thresholds.
 
-Panels: a=DIC (raw), b=binary mask after Sobel+Otsu+morphology (before any
-shape filtering), c=DIC with every component colored green (passes all
-filters) or red (fails at least one), with full stats on hover -- reject
-reasons are not simplified/summarized, hover shows the actual numbers
-against the actual current thresholds.
+Panels: a=DIC (raw, always uncorrected -- a stable visual reference), b=binary
+mask after Sobel+Otsu+morphology (before any shape filtering), c=DIC with
+every component colored green (passes all filters) or red (fails at least
+one), with full stats on hover -- reject reasons are not simplified/
+summarized, hover shows the actual numbers against the actual current
+thresholds.
+
+A "background correction" toggle controls whether the fixed-pattern DIC
+background (quantify_cells.py's compute_dic_background/correct_dic_background
+-- a per-pixel median across every FOV, isolating stationary optical
+artifacts like an out-of-focus dust speck that would otherwise distort a real
+cell's shape during morphological closing) is subtracted before smoothing.
+This changes what's actually fed into the segmentation, so it's a structural
+change like the sliders below it: panels b and c re-render on toggle; panel a
+stays raw either way so there's always a fixed reference to compare against.
 
 A guard against pathological parameter combinations (e.g. sigma near 0,
 which can produce tens of thousands of noise components -- see the
@@ -56,13 +66,14 @@ from quantify_cells import (
     group_fovs, disk, otsu_threshold, fit_ellipse, UM_PER_PX,
     GAUSSIAN_SIGMA, THRESHOLD_MULT, CLOSE_RADIUS_PX, OPEN_RADIUS_PX, MIN_COMPONENT_AREA_PX,
     LENGTH_UM_RANGE, WIDTH_UM_RANGE, ASPECT_RATIO_RANGE, MIN_SOLIDITY,
+    compute_dic_background, correct_dic_background,
 )
 
 from bokeh.io import curdoc
 from bokeh.layouts import column, row
 from bokeh.models import (
     ColumnDataSource, Button, Select, Div, Slider, RangeSlider, HoverTool,
-    LinearColorMapper, Range1d,
+    LinearColorMapper, Range1d, RadioButtonGroup,
 )
 from bokeh.plotting import figure
 
@@ -87,8 +98,10 @@ ASPECT = SAMPLE_HEIGHT / SAMPLE_WIDTH
 PANEL_W = 450
 PANEL_H = int(PANEL_W * ASPECT)
 
+DIC_BACKGROUND = compute_dic_background([paths["DIC"] for _, paths in fov_items])
+
 _dic_cache = {}
-_geometry_cache = {}  # (idx, sigma, threshold_mult, close_r, open_r) -> dict
+_geometry_cache = {}  # (idx, sigma, threshold_mult, close_r, open_r, corrected) -> dict
 
 
 def load_dic(idx):
@@ -102,14 +115,16 @@ def height_to_bokeh_y(row_coords, height):
     return height - row_coords
 
 
-def compute_geometry(idx, sigma, threshold_mult, close_r, open_r):
+def compute_geometry(idx, sigma, threshold_mult, close_r, open_r, corrected):
     """Run the actual segment_dic algorithm (same math, parametrized) and compute
     per-component geometry once. Independent of the filter-slider values."""
-    key = (idx, sigma, threshold_mult, close_r, open_r)
+    key = (idx, sigma, threshold_mult, close_r, open_r, corrected)
     if key in _geometry_cache:
         return _geometry_cache[key]
 
     dic = load_dic(idx)["dic"].astype(np.float64)
+    if corrected:
+        dic = correct_dic_background(dic, DIC_BACKGROUND)
     smooth = ndi.gaussian_filter(dic, sigma=sigma)
     grad_mag = np.hypot(ndi.sobel(smooth, axis=1), ndi.sobel(smooth, axis=0))
     thresh = otsu_threshold(grad_mag.ravel())
@@ -244,6 +259,16 @@ reset_button = Button(label="Reset to calibrated defaults", button_type="primary
 status_div = Div(text="", sizing_mode="stretch_width", styles=FULL_WIDTH_TEXT_STYLE)
 warning_div = Div(text="", sizing_mode="stretch_width", styles=FULL_WIDTH_TEXT_STYLE)
 
+correction_toggle = RadioButtonGroup(
+    labels=["With DIC background correction (production default)", "Without correction (raw DIC)"],
+    active=0, width=500,
+)
+
+
+def correction_enabled():
+    return correction_toggle.active == 0
+
+
 # structural (expensive -- value_throttled, fires on release only)
 sigma_slider = Slider(title="Gaussian smoothing sigma (px)", start=0.0, end=5.0,
                        value=GAUSSIAN_SIGMA, step=0.1, width=340)
@@ -273,7 +298,8 @@ def apply_filters_and_render():
     idx = current_idx[0]
     sigma, threshold_mult = sigma_slider.value, threshold_mult_slider.value
     close_r, open_r = int(close_radius_slider.value), int(open_radius_slider.value)
-    geom = compute_geometry(idx, sigma, threshold_mult, close_r, open_r)
+    corrected = correction_enabled()
+    geom = compute_geometry(idx, sigma, threshold_mult, close_r, open_r, corrected)
 
     min_area = min_area_slider.value
     length_lo, length_hi = length_range_slider.value
@@ -329,6 +355,7 @@ def apply_filters_and_render():
     )
     status_div.text = (
         f"<b>{data['prefix']}FOV{data['fov_num']}</b> &mdash; FOV {idx + 1} of {len(fov_items)} "
+        f"&mdash; background correction: <b>{'ON' if corrected else 'OFF'}</b> "
         f"&mdash; {geom['n_raw_components']} raw component(s) &mdash; "
         f"<b>{n_accepted} accepted</b> of {len(geom['components'])} evaluated"
     )
@@ -353,7 +380,7 @@ def render_mask():
     idx = current_idx[0]
     sigma, threshold_mult = sigma_slider.value, threshold_mult_slider.value
     close_r, open_r = int(close_radius_slider.value), int(open_radius_slider.value)
-    geom = compute_geometry(idx, sigma, threshold_mult, close_r, open_r)
+    geom = compute_geometry(idx, sigma, threshold_mult, close_r, open_r, correction_enabled())
     mask_src.data = dict(image=[np.flipud(geom["mask"]).astype(np.float64)])
 
 
@@ -378,7 +405,13 @@ def on_select(attr, old, new):
     show_fov(int(new))
 
 
+def on_correction_toggle_change(attr, old, new):
+    render_mask()
+    apply_filters_and_render()
+
+
 def on_reset():
+    correction_toggle.active = 0
     sigma_slider.value = GAUSSIAN_SIGMA
     threshold_mult_slider.value = THRESHOLD_MULT
     close_radius_slider.value = CLOSE_RADIUS_PX
@@ -396,6 +429,7 @@ prev_button.on_click(on_prev)
 next_button.on_click(on_next)
 fov_select.on_change("value", on_select)
 reset_button.on_click(on_reset)
+correction_toggle.on_change("active", on_correction_toggle_change)
 
 for slider in (sigma_slider, threshold_mult_slider, close_radius_slider, open_radius_slider):
     slider.on_change("value_throttled", on_structural_change)
@@ -412,11 +446,15 @@ instructions = Div(text=(
     "components, live while dragging. Panel c colors every evaluated component "
     "green (passes all filters) or red (fails at least one) -- hover any shape "
     "for its exact numbers against the current thresholds. Panels a-c share "
-    "pan/zoom.</p>"
+    "pan/zoom. Panel a always shows the raw DIC image as a fixed reference; the "
+    "toggle below controls whether the fixed-pattern background (e.g. a dust "
+    "speck stuck at the same pixels in every FOV) is subtracted before panels b "
+    "and c are computed.</p>"
 ), sizing_mode="stretch_width", styles=FULL_WIDTH_TEXT_STYLE)
 
 structural_col = column(
     Div(text="<b>Structural (expensive -- updates on release)</b>", styles=WHITE_STYLE),
+    correction_toggle,
     sigma_slider, threshold_mult_slider, close_radius_slider, open_radius_slider,
     styles=WHITE_STYLE,
 )

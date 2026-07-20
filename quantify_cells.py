@@ -12,6 +12,18 @@ solidity fall within the expected P. tricornutum fusiform morphology; the
 size/aspect-ratio bounds below were calibrated against this dataset (see
 project conversation) rather than taken as fixed biological constants.
 
+Before smoothing, each DIC image has a fixed-pattern background subtracted --
+a per-pixel median across every DIC image in the input directory, which
+isolates stationary optical artifacts (e.g. an out-of-focus dust speck that
+shows up at the same pixel location in every FOV) since real cells move from
+FOV to FOV and get suppressed by the median. Left uncorrected, such an
+artifact's edge ring can get pulled into a real cell's mask during
+morphological closing if the cell happens to sit near it, distorting that
+cell's fitted shape. This artifact was confirmed DIC-specific (not present in
+the Chlorophyll/BODIPY channels at the same pixel location), so the
+correction is applied only to the image used for segmentation, not to
+fluorescence quantification.
+
 For each accepted cell, "total" fluorescence is the sum of raw pixel
 intensity within the cell mask; "average" is that total divided by the
 cell's pixel area (i.e. mean intensity per pixel in the cell).
@@ -27,7 +39,11 @@ only Day 3 replicates 1-2, pass --days 3 --reps 1,2). This changes ONLY which
 FOVs are read -- it has no effect on the segmentation or measurement logic,
 and condition/mean-computation is always over whatever set of FOVs is passed
 in, so filtering to a subset is equivalent to re-running the whole analysis
-on that subset (not a post-hoc filter of a full-dataset result).
+on that subset (not a post-hoc filter of a full-dataset result). One
+exception: the DIC background correction above is always estimated from
+every DIC image in input_dir regardless of --days/--reps, since it estimates
+a fixed instrument artifact, not anything biological -- narrowing the FOVs
+being measured shouldn't narrow the sample used to characterize the camera.
 
 Usage:
     python quantify_cells.py <input_dir> <output_dir> [--days 3] [--reps 1,2]
@@ -86,6 +102,22 @@ def otsu_threshold(values, nbins=256):
     m2 = (np.cumsum((hist * centers)[::-1])[::-1]) / np.clip(w2, 1, None)
     var_between = w1[:-1] * w2[1:] * (m1[:-1] - m2[1:]) ** 2
     return centers[np.argmax(var_between)]
+
+
+def compute_dic_background(dic_paths):
+    """Per-pixel median across every given DIC image. Real cells occupy different
+    pixels from FOV to FOV and get suppressed by the median; a stationary optical
+    artifact (e.g. a dust speck) appears at the same pixels in every FOV and survives,
+    so this map isolates the fixed pattern rather than any single FOV's biology."""
+    stack = np.stack([tifffile.imread(p).astype(np.float64) for p in dic_paths])
+    return np.median(stack, axis=0)
+
+
+def correct_dic_background(dic_img, background):
+    """Subtract the fixed-pattern deviation of `background` from its own median
+    level, flattening stationary artifacts while leaving genuine per-FOV structure
+    (real illumination, real cells) untouched."""
+    return dic_img.astype(np.float64) - (background - np.median(background))
 
 
 def segment_dic(dic_img):
@@ -247,9 +279,23 @@ def main():
     if args.qc_overlays:
         os.makedirs(qc_dir, exist_ok=True)
 
+    all_fovs = group_fovs(args.input_dir)
+    if not all_fovs:
+        raise SystemExit(f"No FOVs found in {args.input_dir}")
+    dic_paths = [paths["DIC"] for paths in all_fovs.values() if "DIC" in paths]
+    dic_background = compute_dic_background(dic_paths)
+    print(f"Computed DIC background from {len(dic_paths)} FOV(s) in {args.input_dir}")
+    plt.figure(figsize=(8, 6))
+    plt.imshow(dic_background, cmap="gray")
+    plt.title("DIC background (per-pixel median across all FOVs)")
+    plt.axis("off")
+    plt.tight_layout()
+    plt.savefig(os.path.join(args.output_dir, "dic_background.png"), dpi=150)
+    plt.close()
+
     days, reps = parse_int_list(args.days), parse_int_list(args.reps)
     rows = []
-    fovs = filter_fovs_by_day_rep(group_fovs(args.input_dir), days=days, reps=reps)
+    fovs = filter_fovs_by_day_rep(all_fovs, days=days, reps=reps)
     if not fovs:
         raise SystemExit(f"No FOVs matched --days={args.days} --reps={args.reps} in {args.input_dir}")
     for (prefix, fov_num), channel_paths in sorted(fovs.items()):
@@ -260,10 +306,11 @@ def main():
 
         condition = prefix.split("_Day")[0]
         dic = tifffile.imread(channel_paths["DIC"])
+        dic_corrected = correct_dic_background(dic, dic_background)
         chl = tifffile.imread(channel_paths["Chlorophyll"]).astype(np.float64)
         bod = tifffile.imread(channel_paths["BODIPY"]).astype(np.float64)
 
-        labeled, n_components = segment_dic(dic)
+        labeled, n_components = segment_dic(dic_corrected)
         cells = list(accepted_cells(labeled, n_components, dic.shape))
         bod_smooth = ndi.gaussian_filter(bod, sigma=LIPID_SMOOTH_SIGMA)
 
@@ -280,7 +327,7 @@ def main():
 
         print(f"{prefix} FOV{fov_num}: {len(cells)} cell(s)")
         if args.qc_overlays:
-            save_qc_overlay(dic, cells, os.path.join(qc_dir, f"{prefix}_FOV{fov_num}_qc.png"))
+            save_qc_overlay(dic_corrected, cells, os.path.join(qc_dir, f"{prefix}_FOV{fov_num}_qc.png"))
 
     df = pd.DataFrame(rows)
     csv_path = os.path.join(args.output_dir, "cell_measurements.csv")
