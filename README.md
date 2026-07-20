@@ -251,10 +251,10 @@ Bokeh's own pan/zoom tools) for detailed inspection — but are otherwise the
 same DIC/Chlorophyll/BODIPY/overlay composite as `composite_figure.py`,
 using the same global per-channel normalization (computed once over
 `<input_dir>`, reusing `composite_figure.py`'s own functions directly — not
-a re-implementation). Panels d and f (the two Chlorophyll+BODIPY overlays,
-raw and registration-corrected) carry the same white 65 px = 10 µm scale
-bar as `composite_figure.py` (`SCALE_BAR_PX`/`SCALE_BAR_UM`, imported
-directly from it).
+a re-implementation). Panels e, d, and f each carry the same white 65 px =
+10 µm scale bar as `composite_figure.py` (`SCALE_BAR_PX`/`SCALE_BAR_UM`,
+imported directly from it), bottom-right, with the "10 µm" label centered
+over the bar.
 
 - **Panel e** is DIC with every accepted cell's mask boundary (from
   `skimage.measure.find_contours` on the exact same tight mask

@@ -178,7 +178,8 @@ SMALL_H = int(SMALL_W * ASPECT)
 
 
 def add_scale_bar(fig, width, height):
-    """White SCALE_BAR_PX = SCALE_BAR_UM um scale bar, bottom-right, matching composite_figure.py's."""
+    """White SCALE_BAR_PX = SCALE_BAR_UM um scale bar, bottom-right, matching composite_figure.py's.
+    Label is horizontally centered over the bar (bokeh's own text_align, not the bar's right edge)."""
     margin = 0.03 * width
     bar_height = max(2, round(0.006 * height))
     x0 = width - margin - SCALE_BAR_PX
@@ -188,8 +189,8 @@ def add_scale_bar(fig, width, height):
         fill_color="white", line_color="white",
     )
     fig.text(
-        x=[x0 + SCALE_BAR_PX], y=[y0 + bar_height * 2.5], text=[f"{SCALE_BAR_UM} µm"],
-        text_color="white", text_align="right", text_baseline="bottom",
+        x=[x0 + SCALE_BAR_PX / 2], y=[y0 + bar_height * 2.5], text=[f"{SCALE_BAR_UM} µm"],
+        text_color="white", text_align="center", text_baseline="bottom",
         text_font_size="10pt", text_font_style="bold",
     )
 
@@ -261,7 +262,8 @@ reg_fig.patches(
     fill_alpha=0, line_color=REG_OUTLINE, line_width=2,
 )
 
-# scale bars on the two Chlorophyll+BODIPY overlay panels (raw and registration-corrected)
+# scale bars: segmentation panel, plus the two Chlorophyll+BODIPY overlays (raw and registration-corrected)
+add_scale_bar(seg_fig, SAMPLE_WIDTH, SAMPLE_HEIGHT)
 add_scale_bar(overlay_fig, SAMPLE_WIDTH, SAMPLE_HEIGHT)
 add_scale_bar(reg_fig, SAMPLE_WIDTH, SAMPLE_HEIGHT)
 
