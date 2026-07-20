@@ -14,11 +14,14 @@ that corrected fluorescence signal actually falls inside each outline.
 
 Panel e: click a cell's outline to flag it as poorly segmented (click again
 to unflag); flagged cells turn red. Use the Freehand Draw tool (toolbar
-icon) to lasso a good cell the pipeline missed -- drag to trace an outline,
-click+Backspace/Delete to remove it. Both flagged cells and missed-cell
-ROIs get a note field below the panels ("why did you select this?"), and
-"Export ROIs" writes everything (with notes) to <output_dir>/flagged_rois.csv
-and <output_dir>/missed_cell_rois.csv.
+icon) to lasso a good cell the pipeline missed -- drag to trace an outline;
+use the "Remove ROI" button next to its note field to delete one drawn
+poorly. Both flagged cells and missed-cell ROIs get a note field below the
+panels ("why did you select this?"), and "Export ROIs" writes everything
+(with notes) to <output_dir>/<flagged filename> and
+<output_dir>/<missed filename> -- both filenames are set in the app itself
+(defaulting to flagged_rois.csv/missed_cell_rois.csv) and are checked for
+an existing file to load back in, both at startup and whenever changed.
 
 Segmentation reuses quantify_cells.segment_dic/accepted_cells/
 count_lipid_bodies verbatim -- this app never re-implements or approximates
@@ -54,14 +57,15 @@ from composite_figure import (
 from bokeh.io import curdoc
 from bokeh.layouts import column, row
 from bokeh.models import (
-    ColumnDataSource, Button, Select, Div, HoverTool, TapTool, TextAreaInput, FreehandDrawTool,
+    ColumnDataSource, Button, Select, Div, HoverTool, TapTool, TextAreaInput, TextInput,
+    FreehandDrawTool,
 )
 from bokeh.plotting import figure
 
 INPUT_DIR = sys.argv[1] if len(sys.argv) > 1 else "renamed_composites"
 OUTPUT_DIR = sys.argv[2] if len(sys.argv) > 2 else "quantification"
-FLAGGED_CSV = os.path.join(OUTPUT_DIR, "flagged_rois.csv")
-MISSED_CSV = os.path.join(OUTPUT_DIR, "missed_cell_rois.csv")
+DEFAULT_FLAGGED_NAME = "flagged_rois.csv"
+DEFAULT_MISSED_NAME = "missed_cell_rois.csv"
 
 FLAGGED_FILL, FLAGGED_LINE = "#E24B4A", "#A32D2D"
 OK_FILL, OK_LINE = "#5DCAA5", "#0F6E56"
@@ -286,7 +290,19 @@ export_button = Button(label="Export ROIs", button_type="primary", width=180)
 export_status_div = Div(text="", width=700, styles=WHITE_STYLE)
 notes_column = column(styles=WHITE_STYLE)
 
+flagged_csv_input = TextInput(title="Flagged cells CSV filename", value=DEFAULT_FLAGGED_NAME, width=320)
+missed_csv_input = TextInput(title="Missed-cell ROIs CSV filename", value=DEFAULT_MISSED_NAME, width=320)
+load_status_div = Div(text="", sizing_mode="stretch_width", styles=FULL_WIDTH_TEXT_STYLE)
+
 current_idx = [0]
+
+
+def flagged_csv_path():
+    return os.path.join(OUTPUT_DIR, flagged_csv_input.value.strip() or DEFAULT_FLAGGED_NAME)
+
+
+def missed_csv_path():
+    return os.path.join(OUTPUT_DIR, missed_csv_input.value.strip() or DEFAULT_MISSED_NAME)
 
 
 def iter_missed_rois():
@@ -322,6 +338,46 @@ def render_flagged_list():
         parts.append("<b>Missed-cell ROIs:</b> none yet.")
 
     flagged_div.text = "".join(parts)
+
+
+def load_existing_exports():
+    """Check flagged/missed CSVs at the current filenames; if present, merge their contents
+    into the in-memory registries (existing in-session entries are not cleared)."""
+    messages = []
+
+    fpath = flagged_csv_path()
+    if os.path.exists(fpath):
+        df = pd.read_csv(fpath, keep_default_na=False)
+        for _, csv_row in df.iterrows():
+            key = (str(csv_row["sample"]), int(csv_row["fov"]), int(csv_row["cell_id"]))
+            measurements = csv_row.drop(labels=["sample", "fov", "cell_id"]).to_dict()
+            measurements["n_lipid_bodies"] = int(measurements["n_lipid_bodies"])
+            flagged_registry[key] = measurements
+        messages.append(f"Loaded {len(df)} flagged cell(s) from {fpath}.")
+    else:
+        messages.append(f"No existing file at {fpath}.")
+
+    mpath = missed_csv_path()
+    if os.path.exists(mpath):
+        df = pd.read_csv(mpath, keep_default_na=False)
+        n_loaded = 0
+        for (sample, fov), group in df.groupby(["sample", "fov"]):
+            group = group.sort_values("roi_index")
+            xs_list, ys_list, notes_list = [], [], []
+            for _, csv_row in group.iterrows():
+                rc_pairs = json.loads(csv_row["polygon_row_col"])
+                xs_list.append([c for r, c in rc_pairs])
+                ys_list.append([SAMPLE_HEIGHT - r for r, c in rc_pairs])
+                notes_list.append(csv_row.get("note", ""))
+            missed_rois_registry[(str(sample), int(fov))] = dict(xs=xs_list, ys=ys_list, note=notes_list)
+            n_loaded += len(group)
+        messages.append(f"Loaded {n_loaded} missed-cell ROI(s) from {mpath}.")
+    else:
+        messages.append(f"No existing file at {mpath}.")
+
+    load_status_div.text = "<br>".join(messages)
+    show_fov(current_idx[0])
+    render_flagged_list()
 
 
 def _cell_note_callback(key):
@@ -493,13 +549,14 @@ def on_select(attr, old, new):
 def on_export():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     n_cells = n_rois = 0
+    fpath, mpath = flagged_csv_path(), missed_csv_path()
 
     if flagged_registry:
         rows = [
             dict(sample=prefix, fov=fov_num, cell_id=cell_id, **measurements)
             for (prefix, fov_num, cell_id), measurements in sorted(flagged_registry.items())
         ]
-        pd.DataFrame(rows).to_csv(FLAGGED_CSV, index=False)
+        pd.DataFrame(rows).to_csv(fpath, index=False)
         n_cells = len(rows)
 
     missed_list = list(iter_missed_rois())
@@ -515,16 +572,20 @@ def on_export():
                 col_min=min(c for r, c in rows_rc), col_max=max(c for r, c in rows_rc),
                 polygon_row_col=json.dumps(rows_rc), note=note,
             ))
-        pd.DataFrame(rows).to_csv(MISSED_CSV, index=False)
+        pd.DataFrame(rows).to_csv(mpath, index=False)
         n_rois = len(rows)
 
     if n_cells == 0 and n_rois == 0:
         export_status_div.text = "Nothing flagged or marked yet -- nothing to export."
         return
     export_status_div.text = (
-        f"Exported {n_cells} flagged cell(s) to {FLAGGED_CSV} and "
-        f"{n_rois} missed-cell ROI(s) to {MISSED_CSV}"
+        f"Exported {n_cells} flagged cell(s) to {fpath} and "
+        f"{n_rois} missed-cell ROI(s) to {mpath}"
     )
+
+
+def on_output_filename_change(attr, old, new):
+    load_existing_exports()
 
 
 prev_button.on_click(on_prev)
@@ -533,6 +594,8 @@ fov_select.on_change("value", on_select)
 cells_src.selected.on_change("indices", on_selected_change)
 missed_src.on_change("data", on_missed_data_change)
 export_button.on_click(on_export)
+flagged_csv_input.on_change("value", on_output_filename_change)
+missed_csv_input.on_change("value", on_output_filename_change)
 
 instructions = Div(text=(
     "<p>Panel <b>e</b>: click a cell outline to flag it as poorly segmented "
@@ -544,12 +607,15 @@ instructions = Div(text=(
     "same DIC mask outlines, to check the correction is centering signal "
     "inside each cell rather than clipping an edge. Add a note to any "
     "flagged cell or missed-cell ROI below the panels, then use "
-    "<b>Export ROIs</b> to write everything to "
-    f"<code>{FLAGGED_CSV}</code> and <code>{MISSED_CSV}</code>.</p>"
+    "<b>Export ROIs</b> to write everything to the two output filenames set "
+    "below -- if either already exists (e.g. from a previous session), its "
+    "contents are loaded back into this dashboard automatically.</p>"
 ), sizing_mode="stretch_width", styles=FULL_WIDTH_TEXT_STYLE)
 
 layout = column(
     instructions,
+    row(flagged_csv_input, missed_csv_input, sizing_mode="stretch_width"),
+    load_status_div,
     row(prev_button, next_button, fov_select),
     status_div,
     row(dic_fig, chl_fig, bod_fig, overlay_fig, sizing_mode="stretch_width"),
@@ -564,6 +630,7 @@ layout = column(
 )
 
 show_fov(0)
+load_existing_exports()
 
 curdoc().add_root(layout)
 curdoc().title = "Cell segmentation QC review"

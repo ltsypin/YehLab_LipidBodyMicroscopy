@@ -279,11 +279,16 @@ over the bar -- except panel d, which shows the bar only, no label
   select this?") below the panels, so the reasoning survives into the
   exported CSVs, not just an unlabeled coordinate.
 - **Export ROIs** writes every flagged cell (sample, FOV, cell ID, its full
-  `quantify_cells.py` measurement row, and its note) to
-  `<output_dir>/flagged_rois.csv`, and every missed-cell ROI (sample, FOV,
-  ROI index, its pixel bounding box *and* full polygon converted back to
-  original image row/col coordinates, and its note) to
-  `<output_dir>/missed_cell_rois.csv`.
+  `quantify_cells.py` measurement row, and its note) and every missed-cell
+  ROI (sample, FOV, ROI index, its pixel bounding box *and* full polygon
+  converted back to original image row/col coordinates, and its note) to
+  two CSVs whose filenames are set directly in the app (two text boxes at
+  the top, defaulting to `flagged_rois.csv`/`missed_cell_rois.csv`, joined
+  with `<output_dir>`). Both filenames are checked for an existing file at
+  startup and whenever changed; if found, its contents are merged into the
+  dashboard's in-memory state (not wiping out whatever's already flagged in
+  the current session) -- so closing and reopening the app, or pointing it
+  at a colleague's export, picks up right where that file left off.
 
 This tool calls `quantify_cells.segment_dic`/`accepted_cells`/
 `count_lipid_bodies` directly, so what it shows is exactly what ends up in
