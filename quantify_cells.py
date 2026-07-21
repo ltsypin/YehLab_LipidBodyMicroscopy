@@ -43,9 +43,27 @@ intensity within the cell mask; "average" is that total divided by the
 cell's pixel area (i.e. mean intensity per pixel in the cell).
 
 Lipid bodies are counted by smoothing the BODIPY channel, Otsu-thresholding
-it within each cell mask, and counting connected bright components above a
-minimum size. Droplets that touch or overlap enough to merge into one
-connected component are counted as a single lipid body.
+it within each cell mask (per cell, not per FOV -- each cell gets its own
+bright/dim cutoff from its own pixels), and watershed-splitting the resulting
+bright mask at local intensity peaks (skimage.feature.peak_local_max +
+skimage.segmentation.watershed) before counting connected components above a
+minimum size. Plain intensity thresholding alone can't separate two droplets
+that are touching if the valley between their brightness peaks never dips
+below the per-cell threshold -- confirmed on this dataset (see project
+conversation): a single 1685px "blob" in one cell was visibly 2-3 distinct
+ring-shaped droplets in the raw BODIPY. Watershed finds one seed per local
+intensity peak and floods outward from each, splitting at the ridge between
+them; a single-peak blob watersheds right back to itself, so this only helps
+merged cases, it doesn't change anything for already-distinct droplets.
+WATERSHED_MIN_DISTANCE_PX controls how close two peaks can be before they're
+treated as one (not yet tuned dataset-wide -- see project conversation for
+the tradeoff between under- and over-splitting on ring-shaped droplets).
+
+Plastids in the Chlorophyll channel are counted the same way (count_plastids,
+sharing count_bright_blobs' logic with count_lipid_bodies). P. tricornutum
+normally carries a single plastid that duplicates before the cell divides, so
+>1 detected plastid is a candidate marker for a dividing cell -- this hasn't
+been validated against any ground-truth dividing-cell annotation yet.
 
 Use --days/--reps to restrict the analysis to specific Day/replicate numbers,
 parsed from the "<Condition>_Day<N>_rep<M>" filename prefix (e.g. to analyze
@@ -75,6 +93,8 @@ import tifffile
 import scipy.ndimage as ndi
 from scipy.spatial import ConvexHull
 from skimage.morphology import skeletonize
+from skimage.feature import peak_local_max
+from skimage.segmentation import watershed
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -101,6 +121,14 @@ SKELETON_TIP_MARGIN_PX = 20  # branch points within this geodesic distance of a 
 
 LIPID_SMOOTH_SIGMA = 1.0
 LIPID_MIN_SIZE_PX = 3
+LIPID_WATERSHED_MIN_DISTANCE_PX = 3
+
+# Plastid counting (Chlorophyll channel) shares count_bright_blobs with lipid-body
+# counting, but has no calibrated precedent of its own yet -- these starting values
+# just mirror the lipid-body defaults (see project conversation).
+PLASTID_SMOOTH_SIGMA = 1.0
+PLASTID_MIN_SIZE_PX = 3
+PLASTID_WATERSHED_MIN_DISTANCE_PX = 3
 
 CONDITION_ORDER = ["Nitrate", "Arginine", "Urea"]
 
@@ -268,17 +296,45 @@ def accepted_cells(labeled, n_components, image_shape):
         )
 
 
-def count_lipid_bodies(bodipy_smooth, ys, xs):
-    """Number of distinct BODIPY-bright connected components within a cell mask."""
-    cell_mask = np.zeros(bodipy_smooth.shape, dtype=bool)
+def count_bright_blobs(channel_smooth, ys, xs, min_size_px, watershed_min_distance):
+    """Number of distinct bright blobs within a cell mask, in an already-smoothed
+    fluorescence channel. Per-cell Otsu threshold (not a global one -- each cell gets
+    its own bright/dim cutoff from its own pixels), then watershed-split at local
+    intensity peaks before counting connected components above min_size_px: two
+    touching bright regions whose valley never dips below the per-cell threshold
+    still get separated instead of merged into one count. A blob with only one local
+    peak watersheds right back to itself unchanged."""
+    cell_mask = np.zeros(channel_smooth.shape, dtype=bool)
     cell_mask[ys, xs] = True
-    thresh = otsu_threshold(bodipy_smooth[ys, xs])
-    bright_mask = cell_mask & (bodipy_smooth > thresh)
-    labeled, n = ndi.label(bright_mask, structure=np.ones((3, 3)))
+    thresh = otsu_threshold(channel_smooth[ys, xs])
+    bright_mask = cell_mask & (channel_smooth > thresh)
+
+    coords = peak_local_max(channel_smooth, min_distance=watershed_min_distance, labels=bright_mask.astype(int))
+    if len(coords) == 0:
+        labeled, n = ndi.label(bright_mask, structure=np.ones((3, 3)))
+    else:
+        markers = np.zeros(channel_smooth.shape, dtype=int)
+        markers[coords[:, 0], coords[:, 1]] = np.arange(1, len(coords) + 1)
+        labeled = watershed(-channel_smooth, markers=markers, mask=bright_mask, connectivity=2)
+        n = int(labeled.max())
+
     if n == 0:
         return 0
     sizes = ndi.sum(bright_mask, labeled, index=np.arange(1, n + 1))
-    return int(np.sum(sizes >= LIPID_MIN_SIZE_PX))
+    return int(np.sum(sizes >= min_size_px))
+
+
+def count_lipid_bodies(bodipy_smooth, ys, xs):
+    """Number of distinct BODIPY-bright lipid bodies within a cell mask."""
+    return count_bright_blobs(bodipy_smooth, ys, xs, LIPID_MIN_SIZE_PX, LIPID_WATERSHED_MIN_DISTANCE_PX)
+
+
+def count_plastids(chlorophyll_smooth, ys, xs):
+    """Number of distinct Chlorophyll-bright plastids within a cell mask. P.
+    tricornutum normally carries a single plastid that duplicates before the cell
+    divides, so >1 here is a candidate marker for a dividing cell (not yet validated
+    against ground truth -- see project conversation)."""
+    return count_bright_blobs(chlorophyll_smooth, ys, xs, PLASTID_MIN_SIZE_PX, PLASTID_WATERSHED_MIN_DISTANCE_PX)
 
 
 def group_fovs(directory):
@@ -405,6 +461,7 @@ def main():
         labeled, n_components = segment_dic(dic_corrected)
         cells = list(accepted_cells(labeled, n_components, dic.shape))
         bod_smooth = ndi.gaussian_filter(bod, sigma=LIPID_SMOOTH_SIGMA)
+        chl_smooth = ndi.gaussian_filter(chl, sigma=PLASTID_SMOOTH_SIGMA)
 
         for cell_id, (ys, xs, props) in enumerate(cells, start=1):
             total_chl, total_bod = chl[ys, xs].sum(), bod[ys, xs].sum()
@@ -415,6 +472,7 @@ def main():
                 avg_chlorophyll=total_chl / props["area_px"],
                 avg_bodipy=total_bod / props["area_px"],
                 n_lipid_bodies=count_lipid_bodies(bod_smooth, ys, xs),
+                n_plastids=count_plastids(chl_smooth, ys, xs),
             ))
 
         print(f"{prefix} FOV{fov_num}: {len(cells)} cell(s)")
@@ -430,6 +488,10 @@ def main():
     make_categorical_plot(
         df, "n_lipid_bodies", "Number of lipid bodies per cell",
         os.path.join(args.output_dir, "lipid_bodies_per_cell.png"),
+    )
+    make_categorical_plot(
+        df, "n_plastids", "Number of plastids per cell",
+        os.path.join(args.output_dir, "plastids_per_cell.png"),
     )
     print(f"Saved plots to {args.output_dir}")
 

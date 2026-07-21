@@ -29,6 +29,16 @@ one), with full stats on hover -- reject reasons are not simplified/
 summarized, hover shows the actual numbers against the actual current
 thresholds.
 
+A component that fails the solidity threshold gets a second chance via
+quantify_cells.py's has_body_branch: a straight-line convex-hull solidity
+penalizes bending alone, not just real defects, so a genuinely curved (but
+otherwise clean) cell can fail it for no real reason. has_body_branch
+skeletonizes the component and checks whether any skeleton branch point sits
+far from both of its tips (geodesic distance, so curvature doesn't confuse
+it) -- a bent-but-clean cell has none; a truly malformed one (two cells
+merged, debris fused on) does. This can only rescue a component out of the
+"solidity" reject reason, never add it, mirroring the OR logic in production.
+
 A "background correction" toggle controls whether the fixed-pattern DIC
 background (quantify_cells.py's compute_dic_background/correct_dic_background
 -- a per-pixel median across every FOV, isolating stationary optical
@@ -66,7 +76,7 @@ from quantify_cells import (
     group_fovs, disk, otsu_threshold, fit_ellipse, UM_PER_PX,
     GAUSSIAN_SIGMA, THRESHOLD_MULT, CLOSE_RADIUS_PX, OPEN_RADIUS_PX, MIN_COMPONENT_AREA_PX,
     LENGTH_UM_RANGE, WIDTH_UM_RANGE, ASPECT_RATIO_RANGE, MIN_SOLIDITY,
-    compute_dic_background, correct_dic_background,
+    compute_dic_background, correct_dic_background, has_body_branch,
 )
 
 from bokeh.io import curdoc
@@ -161,12 +171,16 @@ def compute_geometry(idx, sigma, threshold_mult, close_r, open_r, corrected):
         else:
             hull_area = 0
         solidity = area / hull_area if hull_area > 0 else 0
+        local_mask = np.zeros((ys.max() - ys.min() + 3, xs.max() - xs.min() + 3), dtype=bool)
+        local_mask[ys - ys.min() + 1, xs - xs.min() + 1] = True
+        body_branch = has_body_branch(local_mask)
         touches_border = ys.min() == 0 or xs.min() == 0 or ys.max() == height - 1 or xs.max() == width - 1
         contour_ys = height_to_bokeh_y(ys, height)
         components.append(dict(
             ys=ys, xs=xs, area=area,
             length_um=major_px * UM_PER_PX, width_um=minor_px * UM_PER_PX,
-            aspect_ratio=major_px / minor_px, solidity=solidity, touches_border=touches_border,
+            aspect_ratio=major_px / minor_px, solidity=solidity, body_branch=body_branch,
+            touches_border=touches_border,
             cy=float(contour_ys.mean()), cx=float(xs.mean()),
         ))
 
@@ -229,7 +243,7 @@ result_fig.image(image="image", x=0, y=0, dw=SAMPLE_WIDTH, dh=SAMPLE_HEIGHT, sou
 
 components_src = ColumnDataSource(data=dict(
     xs=[], ys=[], fill_color=[], line_color=[],
-    area=[], length_um=[], width_um=[], aspect_ratio=[], solidity=[], status=[],
+    area=[], length_um=[], width_um=[], aspect_ratio=[], solidity=[], body_branch=[], status=[],
 ))
 patches = result_fig.patches(
     xs="xs", ys="ys", source=components_src,
@@ -242,6 +256,7 @@ result_fig.add_tools(HoverTool(renderers=[patches], tooltips=[
     ("width (um)", "@width_um{0.0}"),
     ("aspect ratio", "@aspect_ratio{0.00}"),
     ("solidity", "@solidity{0.000}"),
+    ("body branch defect", "@body_branch"),
 ]))
 
 # ---------------------------------------------------------------------------
@@ -310,6 +325,7 @@ def apply_filters_and_render():
     height = load_dic(idx)["dic"].shape[0]
     xs_list, ys_list, fill_color, line_color = [], [], [], []
     area_list, length_list, width_list, aspect_list, solidity_list, status_list = [], [], [], [], [], []
+    body_branch_list = []
     n_accepted = 0
 
     for comp in geom["components"]:
@@ -322,7 +338,8 @@ def apply_filters_and_render():
             reasons.append("width")
         if not (aspect_lo <= comp["aspect_ratio"] <= aspect_hi):
             reasons.append("aspect")
-        if comp["solidity"] < min_solidity:
+        solidity_low = comp["solidity"] < min_solidity
+        if solidity_low and comp["body_branch"]:
             reasons.append("solidity")
         if comp["touches_border"]:
             reasons.append("border")
@@ -339,12 +356,17 @@ def apply_filters_and_render():
         width_list.append(round(comp["width_um"], 2))
         aspect_list.append(round(comp["aspect_ratio"], 3))
         solidity_list.append(round(comp["solidity"], 4))
-        status_list.append("accepted" if accepted else "rejected: " + ",".join(reasons))
+        body_branch_list.append("yes" if comp["body_branch"] else "no")
+        status = "accepted" if accepted else "rejected: " + ",".join(reasons)
+        if solidity_low and not comp["body_branch"]:
+            status += " (solidity rescued: curved, no body defect)"
+        status_list.append(status)
 
     components_src.data = dict(
         xs=xs_list, ys=ys_list, fill_color=fill_color, line_color=line_color,
         area=area_list, length_um=length_list, width_um=width_list,
-        aspect_ratio=aspect_list, solidity=solidity_list, status=status_list,
+        aspect_ratio=aspect_list, solidity=solidity_list, body_branch=body_branch_list,
+        status=status_list,
     )
 
     data = load_dic(idx)
