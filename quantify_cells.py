@@ -24,6 +24,20 @@ the Chlorophyll/BODIPY channels at the same pixel location), so the
 correction is applied only to the image used for segmentation, not to
 fluorescence quantification.
 
+A straight-line convex-hull solidity penalizes genuinely curved (but
+otherwise clean) fusiform cells, since bending alone moves area away from the
+hull without indicating anything wrong with the cell. A component that fails
+the solidity cutoff gets a second chance via has_body_branch: skeletonize its
+mask, find its two tips via geodesic distance (robust to curvature and to
+both sharp- and blunt-tip skeletonization artifacts), and check whether any
+skeleton branch point sits far from both tips. A bent-but-clean cell's
+skeleton has no such branch; a genuinely bad component (two cells merged, a
+piece of debris fused on) does. This can only ADD acceptances, never remove
+one: anything that already passes the solidity cutoff is accepted regardless
+of its skeleton, so this cannot regress an already-good detection -- see
+project conversation for the calibration data (dataset-wide false accept/
+reject rates against known curved and known malformed components).
+
 For each accepted cell, "total" fluorescence is the sum of raw pixel
 intensity within the cell mask; "average" is that total divided by the
 cell's pixel area (i.e. mean intensity per pixel in the cell).
@@ -53,13 +67,14 @@ import argparse
 import glob
 import os
 import re
-from collections import defaultdict
+from collections import defaultdict, deque
 
 import numpy as np
 import pandas as pd
 import tifffile
 import scipy.ndimage as ndi
 from scipy.spatial import ConvexHull
+from skimage.morphology import skeletonize
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -80,6 +95,9 @@ LENGTH_UM_RANGE = (15.0, 40.0)
 WIDTH_UM_RANGE = (2.0, 7.0)
 ASPECT_RATIO_RANGE = (5.0, 16.0)
 MIN_SOLIDITY = 0.75
+
+SKELETON_PRUNE_ITER = 10     # strips spurs shorter than this (px) -- removes sharp/blunt tip artifacts
+SKELETON_TIP_MARGIN_PX = 20  # branch points within this geodesic distance of a tip are tip noise, not defects
 
 LIPID_SMOOTH_SIGMA = 1.0
 LIPID_MIN_SIZE_PX = 3
@@ -142,6 +160,77 @@ def fit_ellipse(ys, xs):
     return 4 * np.sqrt(l1), 4 * np.sqrt(max(l2, 1e-6))
 
 
+def prune_skeleton(skel, n_iter):
+    """Iteratively strip skeleton endpoints n_iter times, removing any spur
+    shorter than n_iter px -- discards tiny noise whiskers before topology checks."""
+    skel = skel.copy()
+    kernel = np.ones((3, 3))
+    for _ in range(n_iter):
+        neighbor_count = ndi.convolve(skel.astype(int), kernel, mode="constant") - skel.astype(int)
+        endpoints = skel & (neighbor_count == 1)
+        if not endpoints.any():
+            break
+        skel = skel & ~endpoints
+    return skel
+
+
+def _geodesic_distances(skel, start):
+    """BFS distance (in px, along the skeleton) from `start` to every other skeleton pixel."""
+    dist = -np.ones(skel.shape, dtype=int)
+    sy, sx = start
+    dist[sy, sx] = 0
+    queue = deque([(sy, sx)])
+    while queue:
+        y, x = queue.popleft()
+        d = dist[y, x]
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dy == 0 and dx == 0:
+                    continue
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < skel.shape[0] and 0 <= nx < skel.shape[1] and skel[ny, nx] and dist[ny, nx] == -1:
+                    dist[ny, nx] = d + 1
+                    queue.append((ny, nx))
+    return dist
+
+
+def _find_tips(skel):
+    """The skeleton's two tips via the standard double-BFS-sweep diameter heuristic:
+    farthest point from an arbitrary start, then farthest point from that. Robust to
+    blunt cell ends, where the true tip can have degree >1 in the raster skeleton (a
+    fork artifact of the medial-axis transform), so it can't reliably be found by
+    looking for degree-1 pixels alone."""
+    any_point = tuple(np.argwhere(skel)[0])
+    dist_from_any = _geodesic_distances(skel, any_point)
+    tip_a = tuple(np.unravel_index(np.argmax(np.where(skel, dist_from_any, -1)), skel.shape))
+    dist_from_a = _geodesic_distances(skel, tip_a)
+    tip_b = tuple(np.unravel_index(np.argmax(np.where(skel, dist_from_a, -1)), skel.shape))
+    dist_from_b = _geodesic_distances(skel, tip_b)
+    return dist_from_a, dist_from_b
+
+
+def has_body_branch(mask):
+    """True if `mask`'s skeleton has a branch point far from both of its tips -- a
+    real attached defect (e.g. two cells merged, debris fused on), as opposed to a
+    skeletonization-noise fork at a sharp or blunt tip. Uses geodesic (along-skeleton)
+    distance throughout, so a bent cell's tips are found correctly regardless of how
+    much it curves -- this is what lets a merely-curved cell pass while a genuinely
+    malformed one still fails."""
+    skel = prune_skeleton(skeletonize(mask), SKELETON_PRUNE_ITER)
+    kernel = np.ones((3, 3))
+    neighbor_count = ndi.convolve(skel.astype(int), kernel, mode="constant") - skel.astype(int)
+    neighbor_count = neighbor_count * skel
+    branch_points = list(zip(*np.where((neighbor_count >= 3) & skel)))
+    if not branch_points:
+        return False
+
+    dist_from_a, dist_from_b = _find_tips(skel)
+    return any(
+        min(dist_from_a[by, bx], dist_from_b[by, bx]) > SKELETON_TIP_MARGIN_PX
+        for by, bx in branch_points
+    )
+
+
 def accepted_cells(labeled, n_components, image_shape):
     """Yield (ys, xs) pixel coordinates for each component that passes the morphology filters."""
     height, width = image_shape
@@ -168,7 +257,10 @@ def accepted_cells(labeled, n_components, image_shape):
         hull_area = ConvexHull(np.column_stack([xs, ys])).volume
         solidity = area / hull_area if hull_area > 0 else 0
         if solidity < MIN_SOLIDITY:
-            continue
+            local_mask = np.zeros((ys.max() - ys.min() + 3, xs.max() - xs.min() + 3), dtype=bool)
+            local_mask[ys - ys.min() + 1, xs - xs.min() + 1] = True
+            if has_body_branch(local_mask):
+                continue
 
         yield ys, xs, dict(
             area_px=area, length_um=length_um, width_um=width_um,
