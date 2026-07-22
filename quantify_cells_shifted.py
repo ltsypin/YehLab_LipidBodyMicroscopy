@@ -5,6 +5,15 @@ correcting the fluorescence-to-DIC registration shift by translating the
 fluorescence images themselves, then summing within the ORIGINAL tight
 DIC-derived cell mask (no dilation).
 
+DIC segmentation now matches quantify_cells.py's current pipeline exactly:
+the fixed-pattern background is subtracted (compute_dic_background/
+correct_dic_background) before segment_dic, and accepted_cells' solidity
+check gets its curvature-tolerant second chance (has_body_branch) for free,
+since that logic lives inside accepted_cells itself. Previously this script
+called segment_dic on the raw, uncorrected DIC image, so its cell population
+(and cell_id numbering) diverged from quantify_cells.py's -- they should
+match now, modulo whatever --days/--reps filtering each run uses.
+
 The shift (dy=7, dx=-1 px) is the outlier-trimmed median of per-cell centroid
 offsets between DIC-derived chloroplast position and Chlorophyll-channel
 autofluorescence centroid, computed across all 188 cells (excluding other
@@ -31,7 +40,10 @@ why n_plastids/n_lipid_bodies are computed here from the shift-corrected
 channels, not quantify_cells.py's uncorrected ones.
 
 Use --days/--reps to restrict to specific Day/replicate numbers (same
-behavior as quantify_cells.py's --days/--reps -- see that script's docstring).
+behavior as quantify_cells.py's --days/--reps -- see that script's
+docstring). As in quantify_cells.py, the DIC background is always estimated
+from every DIC image in input_dir regardless of --days/--reps, since it
+estimates a fixed instrument artifact, not anything biological.
 """
 
 import argparse
@@ -47,10 +59,13 @@ import scipy.ndimage as ndi
 
 from quantify_cells import (
     CHANNELS, segment_dic, accepted_cells, group_fovs,
+    compute_dic_background, correct_dic_background,
     count_lipid_bodies, count_plastids, LIPID_SMOOTH_SIGMA, PLASTID_SMOOTH_SIGMA,
     FLUORESCENCE_SHIFT_DY_PX, FLUORESCENCE_SHIFT_DX_PX,
     CONDITION_ORDER, make_categorical_plot, parse_int_list, filter_fovs_by_day_rep,
 )
+
+import matplotlib.pyplot as plt  # after quantify_cells import -- that's where matplotlib.use("Agg") happens
 
 SHIFT_DY, SHIFT_DX = FLUORESCENCE_SHIFT_DY_PX, FLUORESCENCE_SHIFT_DX_PX
 
@@ -68,9 +83,23 @@ def main():
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
+    all_fovs = group_fovs(args.input_dir)
+    if not all_fovs:
+        raise SystemExit(f"No FOVs found in {args.input_dir}")
+    dic_paths = [paths["DIC"] for paths in all_fovs.values() if "DIC" in paths]
+    dic_background = compute_dic_background(dic_paths)
+    print(f"Computed DIC background from {len(dic_paths)} FOV(s) in {args.input_dir}")
+    plt.figure(figsize=(8, 6))
+    plt.imshow(dic_background, cmap="gray")
+    plt.title("DIC background (per-pixel median across all FOVs)")
+    plt.axis("off")
+    plt.tight_layout()
+    plt.savefig(os.path.join(args.output_dir, "dic_background.png"), dpi=150)
+    plt.close()
+
     days, reps = parse_int_list(args.days), parse_int_list(args.reps)
     rows = []
-    fovs = filter_fovs_by_day_rep(group_fovs(args.input_dir), days=days, reps=reps)
+    fovs = filter_fovs_by_day_rep(all_fovs, days=days, reps=reps)
     if not fovs:
         raise SystemExit(f"No FOVs matched --days={args.days} --reps={args.reps} in {args.input_dir}")
     for (prefix, fov_num), channel_paths in sorted(fovs.items()):
@@ -80,13 +109,14 @@ def main():
 
         condition = prefix.split("_Day")[0]
         dic = tifffile.imread(channel_paths["DIC"])
+        dic_corrected = correct_dic_background(dic, dic_background)
         chl = tifffile.imread(channel_paths["Chlorophyll"]).astype(np.float64)
         bod = tifffile.imread(channel_paths["BODIPY"]).astype(np.float64)
 
         chl_corr = ndi.shift(chl, shift=(args.shift_dy, args.shift_dx), order=1)
         bod_corr = ndi.shift(bod, shift=(args.shift_dy, args.shift_dx), order=1)
 
-        labeled, n_components = segment_dic(dic)
+        labeled, n_components = segment_dic(dic_corrected)
         cells = list(accepted_cells(labeled, n_components, dic.shape))
         bod_corr_smooth = ndi.gaussian_filter(bod_corr, sigma=LIPID_SMOOTH_SIGMA)
         chl_corr_smooth = ndi.gaussian_filter(chl_corr, sigma=PLASTID_SMOOTH_SIGMA)
