@@ -40,6 +40,7 @@ quantify_cells_shifted.py     (adopted approach — see Step 4)
 qc_review_app.py             (interactive segmentation QC tool — see "QC review tool" below)
 segmentation_params_explorer_app.py    (interactive Step 3 segmentation tuning — see "Interactive parameter-exploration tools" below)
 blob_counting_params_explorer_app.py   (interactive lipid-body/plastid counting tuning — see "Interactive parameter-exploration tools" below)
+cell_params_review_app.py    (per-cell manual parameter estimation + notes — see "Per-cell parameter review tool" below)
 ```
 
 Raw `.liff` files and their derived TIFF exports are grouped into a
@@ -453,6 +454,81 @@ across channels.
 This tool calls `quantify_cells.segment_dic`/`accepted_cells`/
 `count_lipid_bodies` directly, so what it shows is exactly what ends up in
 `cell_measurements.csv` — not an approximation of it.
+
+### Per-cell parameter review tool (`cell_params_review_app.py`)
+
+A third interactive tool, merging `qc_review_app.py`'s per-cell note/CSV-export
+workflow with the two parameter-explorer apps above, for walking the whole
+dataset cell by cell and manually estimating segmentation/counting/focus
+parameters per cell — e.g. to compare a human's per-cell parameter estimate
+against an automated optimization, or to check how consistent manual
+estimates are across FOVs/cells.
+
+```
+bokeh serve --show cell_params_review_app.py --args <input_dir> [<output_dir>]
+```
+
+(defaults to `renamed_composites`/`quantification` if omitted; also registered
+in `~/ClaudeCowork/.claude/launch.json` as `bokeh-cell-params-review`, port
+5011.)
+
+Three tabs per cell, all built from `quantify_cells.py`'s own functions (never
+reimplemented):
+
+1. **DIC segmentation** — the same 3-panel view as
+   `segmentation_params_explorer_app.py` (raw DIC / binary mask / accept-reject
+   with hover), at full-FOV scale, with every slider that app exposes. The
+   current cell's outline is drawn in blue on the accept/reject panel for
+   orientation. DIC segmentation is a property of the whole FOV, not one cell,
+   so — unlike the other two tabs — its parameters are saved **per FOV**, not
+   per cell (see "Parameter keying" below).
+2. **Chlorophyll (plastids)** — the same 5-panel view as
+   `blob_counting_params_explorer_app.py` (DIC+outline / raw / smoothed /
+   bright mask / counted-or-too-small), fixed to the Chlorophyll channel, with
+   every slider that app exposes (including the skeleton-clustered prototype
+   method), plus a focus-score testing section: a pre-Laplacian
+   smoothing-sigma slider (0 = matches production's raw/unsmoothed
+   `compute_focus_score`) and a focus-score threshold slider (defaults to
+   `PLASTID_MIN_FOCUS_SCORE`), showing the live focus score and `in_focus`
+   flag for the current cell. **This tool's own starting defaults for this tab
+   are `method="skeleton"` (the skeleton-clustered prototype) and
+   `watershed_min_prominence=600`** — set at the user's explicit request for
+   manual-estimation sessions in this tool specifically; they intentionally
+   differ from `quantify_cells.py`'s own production constant
+   (`PLASTID_WATERSHED_MIN_PROMINENCE=0`, disabled) and from
+   `blob_counting_params_explorer_app.py`'s own defaults, neither of which
+   were changed.
+3. **BODIPY (lipid bodies)** — identical 5-panel view fixed to the BODIPY
+   channel; no focus section, since `compute_focus_score` is not used for
+   BODIPY in production. This tab's own starting default keeps
+   `method="watershed"` (unchanged) but sets `watershed_min_prominence=100`,
+   again a starting point for this tool only.
+
+As in `blob_counting_params_explorer_app.py`, DIC segmentation itself (which
+cells exist and how many) is a **fixed** upstream input for navigation and for
+tabs 2/3's cell list — tab 1's sliders are an independent exploration surface
+layered on top and never change the cell list, so it can't shift under you
+while exploring.
+
+**Parameter keying**: Chlorophyll/BODIPY parameters and the note are saved
+**per cell** (production already computes a per-cell Otsu threshold for blob
+counting). DIC parameters are saved **per FOV** (DIC segmentation runs once
+per FOV, so it wouldn't make sense for the same segmentation to have different
+recorded parameters depending on which of its cells you happened to be
+viewing when you tuned it). The exported CSV still has one row per cell,
+matching `qc_review_app.py`'s convention — every cell sharing a FOV gets that
+FOV's current DIC parameters copied into its row at export time.
+
+**Save behavior**: navigating to another cell (Prev/Next/dropdowns) commits
+the current sliders into an in-memory registry; nothing is written to disk
+until **Export CSV** is clicked. Revisiting an already-committed FOV/cell
+restores its last-committed values into the sliders instead of resetting to
+calibrated defaults, so a prior estimate can be reviewed or revised. The CSV
+filename (default `cell_parameter_review.csv`, joined with `<output_dir>`) is
+checked for an existing file both at startup and whenever changed, and its
+contents are merged into the in-memory registry — mirroring
+`qc_review_app.py`'s flagged-cell CSVs — so closing and reopening the app
+picks up where a previous session left off.
 
 ## Step 4: Fluorescence-to-DIC registration correction
 
