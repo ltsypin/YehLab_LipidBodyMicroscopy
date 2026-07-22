@@ -58,6 +58,14 @@ merged cases, it doesn't change anything for already-distinct droplets.
 WATERSHED_MIN_DISTANCE_PX controls how close two peaks can be before they're
 treated as one (not yet tuned dataset-wide -- see project conversation for
 the tradeoff between under- and over-splitting on ring-shaped droplets).
+WATERSHED_MIN_PROMINENCE is a complementary, non-spatial criterion (disabled
+by default): via skimage.morphology.h_maxima, a peak only survives if it's
+not within WATERSHED_MIN_PROMINENCE intensity units of an equal-or-higher
+peak along every connecting path. This is what distinguishes two real
+neighboring blobs (each has its own peak with a genuinely deep valley
+between them) from one blob with two lobes at different focus/brightness
+(the dip between them never drops back to background) -- see
+count_bright_blobs for the full explanation.
 
 Plastids in the Chlorophyll channel are counted the same way (count_plastids,
 sharing count_bright_blobs' logic with count_lipid_bodies). P. tricornutum
@@ -103,7 +111,7 @@ import pandas as pd
 import tifffile
 import scipy.ndimage as ndi
 from scipy.spatial import ConvexHull
-from skimage.morphology import skeletonize
+from skimage.morphology import skeletonize, h_maxima
 from skimage.feature import peak_local_max
 from skimage.segmentation import watershed
 import matplotlib
@@ -133,6 +141,7 @@ SKELETON_TIP_MARGIN_PX = 20  # branch points within this geodesic distance of a 
 LIPID_SMOOTH_SIGMA = 1.0
 LIPID_MIN_SIZE_PX = 3
 LIPID_WATERSHED_MIN_DISTANCE_PX = 3
+LIPID_WATERSHED_MIN_PROMINENCE = 0  # disabled by default -- not yet explored, see project conversation
 
 # Plastid counting (Chlorophyll channel) shares count_bright_blobs with lipid-body
 # counting, but has no calibrated precedent of its own yet -- these starting values
@@ -140,6 +149,7 @@ LIPID_WATERSHED_MIN_DISTANCE_PX = 3
 PLASTID_SMOOTH_SIGMA = 1.0
 PLASTID_MIN_SIZE_PX = 3
 PLASTID_WATERSHED_MIN_DISTANCE_PX = 3
+PLASTID_WATERSHED_MIN_PROMINENCE = 0  # disabled by default -- not yet explored, see project conversation
 
 # Fluorescence-to-DIC registration offset -- the outlier-trimmed median of per-cell
 # centroid offsets between DIC-derived chloroplast position and Chlorophyll-channel
@@ -331,20 +341,37 @@ def accepted_cells(labeled, n_components, image_shape):
         )
 
 
-def count_bright_blobs(channel_smooth, ys, xs, min_size_px, watershed_min_distance):
+def count_bright_blobs(channel_smooth, ys, xs, min_size_px, watershed_min_distance, watershed_min_prominence=0):
     """Number of distinct bright blobs within a cell mask, in an already-smoothed
     fluorescence channel. Per-cell Otsu threshold (not a global one -- each cell gets
     its own bright/dim cutoff from its own pixels), then watershed-split at local
     intensity peaks before counting connected components above min_size_px: two
     touching bright regions whose valley never dips below the per-cell threshold
     still get separated instead of merged into one count. A blob with only one local
-    peak watersheds right back to itself unchanged."""
+    peak watersheds right back to itself unchanged.
+
+    watershed_min_distance is a purely spatial non-max-suppression radius (px): two
+    peaks closer than this always collapse to one, regardless of how deep the valley
+    between them is. watershed_min_prominence is a different, complementary
+    criterion -- topographic prominence -- that doesn't care about distance at all:
+    via skimage.morphology.h_maxima, a peak only survives if there's no path to an
+    equal-or-higher peak along which the intensity drop is less than
+    watershed_min_prominence. This is what distinguishes two real neighboring blobs
+    (each has its own full-height peak with a genuinely deep valley between them --
+    high prominence, stays split) from one blob with two lobes at slightly different
+    focus/brightness (the dip between them never drops back to background -- low
+    prominence, gets merged). Disabled (0) by default -- not yet calibrated, see
+    project conversation."""
     cell_mask = np.zeros(channel_smooth.shape, dtype=bool)
     cell_mask[ys, xs] = True
     thresh = otsu_threshold(channel_smooth[ys, xs])
     bright_mask = cell_mask & (channel_smooth > thresh)
 
-    coords = peak_local_max(channel_smooth, min_distance=watershed_min_distance, labels=bright_mask.astype(int))
+    search_mask = bright_mask
+    if watershed_min_prominence > 0:
+        search_mask = h_maxima(channel_smooth, watershed_min_prominence).astype(bool) & bright_mask
+
+    coords = peak_local_max(channel_smooth, min_distance=watershed_min_distance, labels=search_mask.astype(int))
     if len(coords) == 0:
         labeled, n = ndi.label(bright_mask, structure=np.ones((3, 3)))
     else:
@@ -361,7 +388,8 @@ def count_bright_blobs(channel_smooth, ys, xs, min_size_px, watershed_min_distan
 
 def count_lipid_bodies(bodipy_smooth, ys, xs):
     """Number of distinct BODIPY-bright lipid bodies within a cell mask."""
-    return count_bright_blobs(bodipy_smooth, ys, xs, LIPID_MIN_SIZE_PX, LIPID_WATERSHED_MIN_DISTANCE_PX)
+    return count_bright_blobs(bodipy_smooth, ys, xs, LIPID_MIN_SIZE_PX, LIPID_WATERSHED_MIN_DISTANCE_PX,
+                               LIPID_WATERSHED_MIN_PROMINENCE)
 
 
 def count_plastids(chlorophyll_smooth, ys, xs):
@@ -369,7 +397,8 @@ def count_plastids(chlorophyll_smooth, ys, xs):
     tricornutum normally carries a single plastid that duplicates before the cell
     divides, so >1 here is a candidate marker for a dividing cell (not yet validated
     against ground truth -- see project conversation)."""
-    return count_bright_blobs(chlorophyll_smooth, ys, xs, PLASTID_MIN_SIZE_PX, PLASTID_WATERSHED_MIN_DISTANCE_PX)
+    return count_bright_blobs(chlorophyll_smooth, ys, xs, PLASTID_MIN_SIZE_PX, PLASTID_WATERSHED_MIN_DISTANCE_PX,
+                               PLASTID_WATERSHED_MIN_PROMINENCE)
 
 
 def group_fovs(directory):

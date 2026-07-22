@@ -81,6 +81,14 @@ did not reliably resize on every cell switch in testing (a cell's image could
 render stretched to the previous cell's crop shape); setting width/height
 directly is deterministic and doesn't depend on that client-side recompute.
 
+Purely for legibility, a crop wider than it is tall gets rotated 90 degrees
+(rotate_crop_for_display/rotate_point_for_display, matching np.rot90) before
+display, on every panel and on every outline/peak drawn on top of them --
+otherwise a horizontally-oriented cell renders thin and small once squeezed
+into a page-width-constrained row of 5 panels. This is cosmetic only: it
+doesn't touch any of the underlying math, just which way the crop is spun
+before rendering.
+
 Parameters split as in segmentation_params_explorer_app.py:
   - Structural (channel, smoothing sigma, threshold multiplier, connectivity,
     method, watershed peak distance): changing these re-runs thresholding
@@ -115,14 +123,15 @@ import scipy.ndimage as ndi
 import tifffile
 from skimage.feature import peak_local_max
 from skimage.segmentation import watershed
+from skimage.morphology import h_maxima
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from quantify_cells import (
     group_fovs, segment_dic, accepted_cells, otsu_threshold, UM_PER_PX,
     compute_dic_background, correct_dic_background, correct_fluorescence_registration,
-    LIPID_SMOOTH_SIGMA, LIPID_MIN_SIZE_PX, LIPID_WATERSHED_MIN_DISTANCE_PX,
-    PLASTID_SMOOTH_SIGMA, PLASTID_MIN_SIZE_PX, PLASTID_WATERSHED_MIN_DISTANCE_PX,
+    LIPID_SMOOTH_SIGMA, LIPID_MIN_SIZE_PX, LIPID_WATERSHED_MIN_DISTANCE_PX, LIPID_WATERSHED_MIN_PROMINENCE,
+    PLASTID_SMOOTH_SIGMA, PLASTID_MIN_SIZE_PX, PLASTID_WATERSHED_MIN_DISTANCE_PX, PLASTID_WATERSHED_MIN_PROMINENCE,
 )
 
 from bokeh.io import curdoc
@@ -150,9 +159,11 @@ CHANNEL_LABELS = ["BODIPY (lipid bodies)", "Chlorophyll (plastids)"]
 CHANNEL_TIFF_KEY = {"BODIPY": "BODIPY", "Chlorophyll": "Chlorophyll"}
 CHANNEL_DEFAULTS = {
     "BODIPY": dict(sigma=LIPID_SMOOTH_SIGMA, threshold_mult=1.0,
-                   min_distance=LIPID_WATERSHED_MIN_DISTANCE_PX, min_size=LIPID_MIN_SIZE_PX),
+                   min_distance=LIPID_WATERSHED_MIN_DISTANCE_PX, min_prominence=LIPID_WATERSHED_MIN_PROMINENCE,
+                   min_size=LIPID_MIN_SIZE_PX),
     "Chlorophyll": dict(sigma=PLASTID_SMOOTH_SIGMA, threshold_mult=1.0,
-                         min_distance=PLASTID_WATERSHED_MIN_DISTANCE_PX, min_size=PLASTID_MIN_SIZE_PX),
+                         min_distance=PLASTID_WATERSHED_MIN_DISTANCE_PX, min_prominence=PLASTID_WATERSHED_MIN_PROMINENCE,
+                         min_size=PLASTID_MIN_SIZE_PX),
 }
 
 all_fovs = group_fovs(INPUT_DIR)
@@ -224,20 +235,40 @@ def crop_bounds(ys, xs, shape, pad=CROP_PAD_PX):
     return r0, r1, c0, c1
 
 
+def rotate_crop_for_display(crop, do_rotate):
+    """90deg CCW (np.rot90 default) if the crop is wider than tall, so a
+    horizontally-oriented cell doesn't render tiny in a page-width-constrained
+    panel row -- purely cosmetic, doesn't change any math."""
+    return np.rot90(crop, k=1) if do_rotate else crop
+
+
+def rotate_point_for_display(r, c, orig_crop_w, do_rotate):
+    """Apply the SAME transform as rotate_crop_for_display to a crop-relative
+    (row, col) point or array of points, so outlines/peaks drawn on top of a
+    rotated image still land in the right place. Matches np.rot90(k=1): a point
+    at (r, c) in a (crop_h, orig_crop_w)-shaped array lands at
+    (orig_crop_w - 1 - c, r) after rotation."""
+    if not do_rotate:
+        return r, c
+    return orig_crop_w - 1 - c, r
+
+
 # ---------------------------------------------------------------------------
 # Core computation
 # ---------------------------------------------------------------------------
 
-_geometry_cache = {}  # (fov_idx, cell_idx, channel, sigma, threshold_mult, connectivity, method, min_distance, registration) -> dict
+_geometry_cache = {}  # (fov_idx, cell_idx, channel, sigma, threshold_mult, connectivity, method, min_distance, min_prominence, registration) -> dict
 
 
-def compute_blob_geometry(fov_idx, cell_idx, channel, sigma, threshold_mult, connectivity, method, min_distance, registration):
+def compute_blob_geometry(fov_idx, cell_idx, channel, sigma, threshold_mult, connectivity, method, min_distance,
+                           min_prominence, registration):
     """Run the actual count_bright_blobs algorithm (same math, parametrized) and
     compute per-blob geometry once. Independent of the min-size filter value.
     method is "threshold" or "watershed" (production's current method -- see
     module docstring). registration=True applies correct_fluorescence_registration
     before anything else, matching quantify_cells_shifted.py."""
-    key = (fov_idx, cell_idx, channel, sigma, threshold_mult, connectivity, method, min_distance, registration)
+    key = (fov_idx, cell_idx, channel, sigma, threshold_mult, connectivity, method, min_distance, min_prominence,
+           registration)
     if key in _geometry_cache:
         return _geometry_cache[key]
 
@@ -257,7 +288,13 @@ def compute_blob_geometry(fov_idx, cell_idx, channel, sigma, threshold_mult, con
 
     peak_ys, peak_xs = np.array([], dtype=int), np.array([], dtype=int)
     if method == "watershed":
-        coords = peak_local_max(smooth, min_distance=int(min_distance), labels=bright_mask.astype(int))
+        # Prominence (topographic: how deep is the valley to the nearest equal-or-
+        # higher peak) is a non-spatial complement to min_distance -- see
+        # quantify_cells.count_bright_blobs' docstring for the full explanation.
+        search_mask = bright_mask
+        if min_prominence > 0:
+            search_mask = h_maxima(smooth, min_prominence).astype(bool) & bright_mask
+        coords = peak_local_max(smooth, min_distance=int(min_distance), labels=search_mask.astype(int))
         if len(coords) == 0:
             structure = np.ones((3, 3)) if connectivity == 8 else None
             labeled, n = ndi.label(bright_mask, structure=structure)
@@ -413,6 +450,8 @@ threshold_mult_slider = Slider(title="Otsu threshold multiplier", start=0.2, end
                                 value=1.0, step=0.05, width=340)
 watershed_min_distance_slider = Slider(title="Watershed minimum peak distance (px)", start=1, end=30,
                                         value=LIPID_WATERSHED_MIN_DISTANCE_PX, step=1, width=340)
+watershed_min_prominence_slider = Slider(title="Watershed minimum peak prominence (intensity units)", start=0, end=1500,
+                                          value=LIPID_WATERSHED_MIN_PROMINENCE, step=10, width=340)
 
 # filter (cheap -- live value, updates while dragging)
 min_size_slider = Slider(title="Minimum blob size (px^2)", start=BLOB_FLOOR_PX, end=100,
@@ -428,9 +467,10 @@ def current_geometry():
     sigma, threshold_mult = sigma_slider.value, threshold_mult_slider.value
     connectivity, method = connectivity_value(), method_value()
     min_distance = watershed_min_distance_slider.value
+    min_prominence = watershed_min_prominence_slider.value
     registration = registration_value()
     return compute_blob_geometry(fov_idx, cell_idx, channel, sigma, threshold_mult, connectivity, method,
-                                  min_distance, registration)
+                                  min_distance, min_prominence, registration)
 
 
 def apply_filters_and_render():
@@ -442,7 +482,9 @@ def apply_filters_and_render():
     min_size = min_size_slider.value
 
     r0, r1, c0, c1 = geom["crop_bounds"]
-    crop_h = r1 - r0
+    crop_h, crop_w = r1 - r0, c1 - c0
+    do_rotate = crop_w > crop_h
+    disp_h = crop_w if do_rotate else crop_h
 
     xs_list, ys_list, fill_color, line_color = [], [], [], []
     size_px_list, size_um2_list, status_list = [], [], []
@@ -451,7 +493,8 @@ def apply_filters_and_render():
     for blob in geom["blobs"]:
         accepted = blob["size_px"] >= min_size
         n_counted += accepted
-        outline_xs, outline_ys = build_outline(blob["ys"] - r0, blob["xs"] - c0, crop_h)
+        blob_r, blob_c = rotate_point_for_display(blob["ys"] - r0, blob["xs"] - c0, crop_w, do_rotate)
+        outline_xs, outline_ys = build_outline(blob_r, blob_c, disp_h)
         xs_list.append(outline_xs)
         ys_list.append(outline_ys)
         fill_color.append(OK_FILL if accepted else REJECT_FILL)
@@ -476,13 +519,15 @@ def apply_filters_and_render():
         f"{MAX_BLOBS} cap -- only the largest {MAX_BLOBS} by size were evaluated."
         if geom["truncated"] else ""
     )
+    min_prominence = watershed_min_prominence_slider.value
     status_div.text = (
         f"<b>{prefix}FOV{fov_num}</b> &mdash; cell {cell_idx + 1} of {n_cells} in this FOV &mdash; "
         f"channel: <b>{channel}</b> &mdash; registration correction: <b>{'ON' if registration_value() else 'OFF'}</b> "
         f"&mdash; per-cell Otsu threshold (smoothed): {geom['thresh']:.1f} &times; {threshold_mult:.2f} "
         f"&mdash; {geom['n_raw_blobs']} raw bright blob(s) &mdash; "
         f"<b>{n_counted} {blob_word}</b> "
-        f"(&ge; {min_size:.0f}px, {connectivity}-connected, method: {method})"
+        f"(&ge; {min_size:.0f}px, {connectivity}-connected, method: {method}, "
+        f"min prominence: {min_prominence:.0f})"
     )
 
 
@@ -491,44 +536,48 @@ def render_static_panels():
     geom = current_geometry()
     r0, r1, c0, c1 = geom["crop_bounds"]
     crop_h, crop_w = r1 - r0, c1 - c0
+    do_rotate = crop_w > crop_h
+    disp_h, disp_w = (crop_w, crop_h) if do_rotate else (crop_h, crop_w)
 
-    # Set each figure's own pixel width/height to match this cell's crop aspect
-    # ratio directly, rather than relying on Bokeh's match_aspect to recompute it
-    # on every range change -- see module docstring for why.
-    if crop_w >= crop_h:
-        fig_w, fig_h = PANEL_W, max(1, round(PANEL_W * crop_h / crop_w))
+    # Set each figure's own pixel width/height to match this cell's DISPLAYED (post-
+    # rotation) aspect ratio directly, rather than relying on Bokeh's match_aspect to
+    # recompute it on every range change -- see module docstring for why.
+    if disp_w >= disp_h:
+        fig_w, fig_h = PANEL_W, max(1, round(PANEL_W * disp_h / disp_w))
     else:
-        fig_w, fig_h = max(1, round(PANEL_W * crop_w / crop_h)), PANEL_W
+        fig_w, fig_h = max(1, round(PANEL_W * disp_w / disp_h)), PANEL_W
     for fig in ALL_FIGS:
         fig.width, fig.height = fig_w, fig_h
 
-    shared_x_range.start, shared_x_range.end = 0, crop_w
-    shared_y_range.start, shared_y_range.end = 0, crop_h
+    shared_x_range.start, shared_x_range.end = 0, disp_w
+    shared_y_range.start, shared_y_range.end = 0, disp_h
 
     raw_fig.title.text = f"b: {channel} raw"
     smooth_fig.title.text = f"c: {channel} smoothed"
 
     dic_corr = load_dic_corrected(current_fov_idx[0])
     dic_crop = dic_corr[r0:r1, c0:c1]
-    dic_src.data = dict(image=[np.flipud(dic_crop)], dw=[crop_w], dh=[crop_h])
+    dic_crop_disp = rotate_crop_for_display(dic_crop, do_rotate)
+    dic_src.data = dict(image=[np.flipud(dic_crop_disp)], dw=[disp_w], dh=[disp_h])
     dic_mapper.low, dic_mapper.high = float(dic_crop.min()), float(dic_crop.max())
 
-    outline_xs, outline_ys = build_outline(geom["cell_ys"] - r0, geom["cell_xs"] - c0, crop_h)
+    cell_r, cell_c = rotate_point_for_display(geom["cell_ys"] - r0, geom["cell_xs"] - c0, crop_w, do_rotate)
+    outline_xs, outline_ys = build_outline(cell_r, cell_c, disp_h)
     cell_outline_src.data = dict(xs=outline_xs, ys=outline_ys)
 
     raw_crop, smooth_crop = geom["raw_crop"], geom["smooth_crop"]
-    raw_src.data = dict(image=[np.flipud(raw_crop)], dw=[crop_w], dh=[crop_h])
-    smooth_src.data = dict(image=[np.flipud(smooth_crop)], dw=[crop_w], dh=[crop_h])
+    raw_src.data = dict(image=[np.flipud(rotate_crop_for_display(raw_crop, do_rotate))], dw=[disp_w], dh=[disp_h])
+    smooth_src.data = dict(image=[np.flipud(rotate_crop_for_display(smooth_crop, do_rotate))], dw=[disp_w], dh=[disp_h])
     # b and c share panel b's (raw) color scale on purpose -- makes over-smoothing's
     # peak-flattening visible, rather than each panel auto-stretched independently.
     channel_mapper.low, channel_mapper.high = float(raw_crop.min()), float(raw_crop.max())
 
-    mask_src.data = dict(image=[np.flipud(geom["bright_mask_crop"])], dw=[crop_w], dh=[crop_h])
+    mask_crop_disp = rotate_crop_for_display(geom["bright_mask_crop"], do_rotate)
+    mask_src.data = dict(image=[np.flipud(mask_crop_disp)], dw=[disp_w], dh=[disp_h])
 
     if len(geom["peak_ys"]):
-        peak_xs_crop = geom["peak_xs"] - c0
-        peak_ys_crop = height_to_bokeh_y(geom["peak_ys"] - r0, crop_h)
-        peaks_src.data = dict(x=peak_xs_crop.tolist(), y=peak_ys_crop.tolist())
+        peak_r, peak_c = rotate_point_for_display(geom["peak_ys"] - r0, geom["peak_xs"] - c0, crop_w, do_rotate)
+        peaks_src.data = dict(x=peak_c.tolist(), y=height_to_bokeh_y(peak_r, disp_h).tolist())
     else:
         peaks_src.data = dict(x=[], y=[])
 
@@ -570,6 +619,7 @@ def on_channel_change(attr, old, new):
     sigma_slider.value = defaults["sigma"]
     threshold_mult_slider.value = defaults["threshold_mult"]
     watershed_min_distance_slider.value = defaults["min_distance"]
+    watershed_min_prominence_slider.value = defaults["min_prominence"]
     min_size_slider.value = defaults["min_size"]
     render_static_panels()
     apply_filters_and_render()
@@ -623,6 +673,7 @@ def on_reset():
     sigma_slider.value = defaults["sigma"]
     threshold_mult_slider.value = defaults["threshold_mult"]
     watershed_min_distance_slider.value = defaults["min_distance"]
+    watershed_min_prominence_slider.value = defaults["min_prominence"]
     min_size_slider.value = defaults["min_size"]
     render_static_panels()
     apply_filters_and_render()
@@ -638,7 +689,7 @@ registration_toggle.on_change("active", on_structural_change)
 connectivity_toggle.on_change("active", on_structural_change)
 method_toggle.on_change("active", on_structural_change)
 
-for slider in (sigma_slider, threshold_mult_slider, watershed_min_distance_slider):
+for slider in (sigma_slider, threshold_mult_slider, watershed_min_distance_slider, watershed_min_prominence_slider):
     slider.on_change("value_throttled", on_structural_change)
 
 min_size_slider.on_change("value", on_filter_change)
@@ -654,19 +705,26 @@ instructions = Div(text=(
     "the difference directly. Production's actual current method is <b>watershed</b> "
     "(the default here) -- <b>Simple threshold</b> is kept for comparison, matching the "
     "pre-watershed behavior. <b>Structural</b> parameters (channel, registration, sigma, "
-    "threshold multiplier, connectivity, watershed peak distance) re-run thresholding "
-    "and labeling on release; the <b>filter</b> parameter (minimum blob size) just "
-    "re-checks the already-labeled blobs, live while dragging. Panel e colors every blob "
-    "green (counted) or red (below the size cutoff) -- hover for its exact size. Panel a "
-    "shows the DIC channel with this cell's own mask outline, for orientation only -- "
-    "the DIC segmentation itself is fixed here; explore it with "
+    "threshold multiplier, connectivity, watershed peak distance/prominence) re-run "
+    "thresholding and labeling on release; the <b>filter</b> parameter (minimum blob "
+    "size) just re-checks the already-labeled blobs, live while dragging. Panel e colors "
+    "every blob green (counted) or red (below the size cutoff) -- hover for its exact "
+    "size. Panel a shows the DIC channel with this cell's own mask outline, for "
+    "orientation only -- the DIC segmentation itself is fixed here; explore it with "
     "segmentation_params_explorer_app.py instead. Prev/Next cell rolls into the "
     "neighboring FOV once you run off either end. Panels a-e share pan/zoom. Watershed "
-    "mode marks detected intensity peaks with x's on panels d/e -- a blob with 2+ peaks "
-    "gets split at the ridge between them; a single-peak blob is unaffected. "
-    "Chlorophyll/plastid defaults are NOT yet calibrated (see module docstring) -- use "
-    "this app to find a sensible min-distance before trusting n_plastids for "
-    "anything.</p>"
+    "mode marks detected intensity peaks with x's on panels d/e -- a blob with 2+ "
+    "surviving peaks gets split at the ridge between them; a single-peak blob is "
+    "unaffected. <b>Minimum peak distance</b> is purely spatial (px) -- two peaks "
+    "closer than this always collapse to one, however deep the valley between them. "
+    "<b>Minimum peak prominence</b> is a different, complementary criterion (intensity "
+    "units, disabled at 0): a peak only survives if there's no path to an equal-or-"
+    "higher peak with an intensity drop smaller than this -- distinguishing two real "
+    "neighboring blobs (deep valley, high prominence, stays split) from one blob with "
+    "two lobes at different focus/brightness (shallow dip that never reaches "
+    "background, low prominence, gets merged). Chlorophyll/plastid defaults are NOT "
+    "yet calibrated (see module docstring) -- use this app to find sensible values "
+    "before trusting n_plastids for anything.</p>"
 ), sizing_mode="stretch_width", styles=FULL_WIDTH_TEXT_STYLE)
 
 structural_col = column(
@@ -675,7 +733,7 @@ structural_col = column(
     registration_toggle,
     connectivity_toggle,
     method_toggle,
-    sigma_slider, threshold_mult_slider, watershed_min_distance_slider,
+    sigma_slider, threshold_mult_slider, watershed_min_distance_slider, watershed_min_prominence_slider,
     styles=WHITE_STYLE,
 )
 filter_col = column(
