@@ -73,6 +73,15 @@ normally carries a single plastid that duplicates before the cell divides, so
 >1 detected plastid is a candidate marker for a dividing cell -- this hasn't
 been validated against any ground-truth dividing-cell annotation yet.
 
+chlorophyll_focus_score (compute_focus_score) flags cells too out-of-focus to
+trust n_plastids for: an out-of-focus plastid's fluorescence spreads into a
+soft, low-contrast blob with no real internal structure, which both looks
+wrong by eye and depresses this score (variance of the Laplacian -- a
+standard autofocus metric) far below an in-focus cell's. in_focus is just
+chlorophyll_focus_score >= PLASTID_MIN_FOCUS_SCORE; nothing is dropped from
+the output, so filtering on it is an explicit downstream choice, not a
+silent exclusion baked into this script.
+
 count_bright_blobs' watershed peak search is restricted to the DIC-derived
 cell mask, which assumes the fluorescence channel is already registered to
 DIC. This script's own main() does NOT apply that registration correction (see
@@ -150,6 +159,16 @@ PLASTID_SMOOTH_SIGMA = 1.0
 PLASTID_MIN_SIZE_PX = 3
 PLASTID_WATERSHED_MIN_DISTANCE_PX = 3
 PLASTID_WATERSHED_MIN_PROMINENCE = 0  # disabled by default -- not yet explored, see project conversation
+
+# Focus score: variance of the Laplacian of the raw, registration-corrected Chlorophyll
+# within a cell's mask -- a standard microscopy autofocus metric (in-focus structure has
+# high-frequency detail; blur suppresses it). Cross-checked against every previously
+# manually-flagged cell in this dataset (see project conversation): all 3 cells flagged
+# "out of focus" scored in the 5th-7th percentile of the whole dataset, while cells
+# flagged for unrelated reasons (incomplete/ragged segmentation) scored 49th-99th --
+# a clean separation. PLASTID_MIN_FOCUS_SCORE is an informed starting cutoff (~10th
+# percentile), not yet exhaustively validated at the boundary.
+PLASTID_MIN_FOCUS_SCORE = 580
 
 # Fluorescence-to-DIC registration offset -- the outlier-trimmed median of per-cell
 # centroid offsets between DIC-derived chloroplast position and Chlorophyll-channel
@@ -401,6 +420,15 @@ def count_plastids(chlorophyll_smooth, ys, xs):
                                PLASTID_WATERSHED_MIN_PROMINENCE)
 
 
+def compute_focus_score(channel_img, ys, xs):
+    """Variance of the Laplacian of `channel_img` (raw, NOT smoothed -- smoothing
+    would itself suppress the high-frequency detail this is meant to detect) within
+    a cell's mask. Low score = blurry/out-of-focus; see PLASTID_MIN_FOCUS_SCORE
+    above for how this was calibrated against real flagged cells."""
+    laplacian = ndi.laplace(channel_img.astype(np.float64))
+    return float(laplacian[ys, xs].var())
+
+
 def group_fovs(directory):
     fovs = defaultdict(dict)
     for path in glob.glob(os.path.join(directory, "*.tiff")):
@@ -529,6 +557,7 @@ def main():
 
         for cell_id, (ys, xs, props) in enumerate(cells, start=1):
             total_chl, total_bod = chl[ys, xs].sum(), bod[ys, xs].sum()
+            focus_score = compute_focus_score(chl, ys, xs)
             rows.append(dict(
                 condition=condition, sample=prefix, fov=fov_num, cell_id=cell_id,
                 **props,
@@ -537,6 +566,8 @@ def main():
                 avg_bodipy=total_bod / props["area_px"],
                 n_lipid_bodies=count_lipid_bodies(bod_smooth, ys, xs),
                 n_plastids=count_plastids(chl_smooth, ys, xs),
+                chlorophyll_focus_score=focus_score,
+                in_focus=focus_score >= PLASTID_MIN_FOCUS_SCORE,
             ))
 
         print(f"{prefix} FOV{fov_num}: {len(cells)} cell(s)")

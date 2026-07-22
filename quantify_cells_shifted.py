@@ -60,7 +60,8 @@ import scipy.ndimage as ndi
 from quantify_cells import (
     CHANNELS, segment_dic, accepted_cells, group_fovs,
     compute_dic_background, correct_dic_background,
-    count_lipid_bodies, count_plastids, LIPID_SMOOTH_SIGMA, PLASTID_SMOOTH_SIGMA,
+    count_lipid_bodies, count_plastids, compute_focus_score,
+    LIPID_SMOOTH_SIGMA, PLASTID_SMOOTH_SIGMA, PLASTID_MIN_FOCUS_SCORE,
     FLUORESCENCE_SHIFT_DY_PX, FLUORESCENCE_SHIFT_DX_PX,
     CONDITION_ORDER, make_categorical_plot, parse_int_list, filter_fovs_by_day_rep,
 )
@@ -123,6 +124,7 @@ def main():
 
         for cell_id, (ys, xs, props) in enumerate(cells, start=1):
             total_chl, total_bod = chl_corr[ys, xs].sum(), bod_corr[ys, xs].sum()
+            focus_score = compute_focus_score(chl_corr, ys, xs)
             rows.append(dict(
                 condition=condition, sample=prefix, fov=fov_num, cell_id=cell_id,
                 **props,
@@ -131,6 +133,8 @@ def main():
                 avg_bodipy=total_bod / props["area_px"],
                 n_lipid_bodies=count_lipid_bodies(bod_corr_smooth, ys, xs),
                 n_plastids=count_plastids(chl_corr_smooth, ys, xs),
+                chlorophyll_focus_score=focus_score,
+                in_focus=focus_score >= PLASTID_MIN_FOCUS_SCORE,
             ))
 
     df = pd.DataFrame(rows)

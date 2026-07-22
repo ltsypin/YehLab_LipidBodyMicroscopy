@@ -66,6 +66,28 @@ on by default, matching quantify_cells_shifted.py.
 
 Detected watershed peaks are drawn as x marks on panels d and e.
 
+A third method, "Watershed, skeleton-clustered (prototype)", is an unvalidated
+attempt to fix a case neither min_distance nor min_prominence alone could
+handle: a dividing cell whose two real plastids each have their own internal
+texture, producing several raw sub-peaks that no single global spatial or
+intensity cutoff could group into "2" without also breaking an already-correct
+case elsewhere (see project conversation for the systematic sigma/min_distance/
+min_prominence sweep that failed on both cases at once). Instead of grouping
+peaks by raw distance or intensity, this reuses the cell's own DIC-derived
+skeleton (identical construction to has_body_branch's, computed once per cell
+regardless of channel/threshold settings) to project every raw peak onto a
+curvature-tolerant coordinate: arc-length along the cell's centerline, and
+which side of it. Peaks belonging to the same true plastid tend to cluster
+tightly in both; peaks from two genuinely different (e.g. dividing) plastids
+tend to fall on opposite sides. Peaks within skeleton_cluster_gap of each other
+on the SAME side get merged into one watershed marker (instead of one marker
+per raw peak), so the final blob count is the number of clusters, not the
+number of raw peaks. The skeleton, its two tips, and every raw peak are drawn
+on panel a when this method is active (cyan dots, green triangles, red x's);
+skeleton_info_div below the sliders lists each peak's arc-length/side/cluster
+assignment as text. This is a prototype for exploring the idea, not yet a
+validated replacement for min_distance/min_prominence.
+
 Navigation is two-level: pick a field of view, then step through that FOV's
 accepted cells (Prev/Next roll over into the neighboring FOV once you run off
 either end, skipping any FOV with zero accepted cells). Each FOV's cell list
@@ -123,13 +145,14 @@ import scipy.ndimage as ndi
 import tifffile
 from skimage.feature import peak_local_max
 from skimage.segmentation import watershed
-from skimage.morphology import h_maxima
+from skimage.morphology import h_maxima, skeletonize
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from quantify_cells import (
     group_fovs, segment_dic, accepted_cells, otsu_threshold, UM_PER_PX,
     compute_dic_background, correct_dic_background, correct_fluorescence_registration,
+    prune_skeleton, _geodesic_distances, SKELETON_PRUNE_ITER,
     LIPID_SMOOTH_SIGMA, LIPID_MIN_SIZE_PX, LIPID_WATERSHED_MIN_DISTANCE_PX, LIPID_WATERSHED_MIN_PROMINENCE,
     PLASTID_SMOOTH_SIGMA, PLASTID_MIN_SIZE_PX, PLASTID_WATERSHED_MIN_DISTANCE_PX, PLASTID_WATERSHED_MIN_PROMINENCE,
 )
@@ -157,13 +180,15 @@ REJECT_FILL, REJECT_LINE = "#E24B4A", "#A32D2D"
 
 CHANNEL_LABELS = ["BODIPY (lipid bodies)", "Chlorophyll (plastids)"]
 CHANNEL_TIFF_KEY = {"BODIPY": "BODIPY", "Chlorophyll": "Chlorophyll"}
+DEFAULT_CLUSTER_GAP_PX = 20  # prototype only, not calibrated -- see module docstring
+
 CHANNEL_DEFAULTS = {
     "BODIPY": dict(sigma=LIPID_SMOOTH_SIGMA, threshold_mult=1.0,
                    min_distance=LIPID_WATERSHED_MIN_DISTANCE_PX, min_prominence=LIPID_WATERSHED_MIN_PROMINENCE,
-                   min_size=LIPID_MIN_SIZE_PX),
+                   cluster_gap=DEFAULT_CLUSTER_GAP_PX, min_size=LIPID_MIN_SIZE_PX),
     "Chlorophyll": dict(sigma=PLASTID_SMOOTH_SIGMA, threshold_mult=1.0,
                          min_distance=PLASTID_WATERSHED_MIN_DISTANCE_PX, min_prominence=PLASTID_WATERSHED_MIN_PROMINENCE,
-                         min_size=PLASTID_MIN_SIZE_PX),
+                         cluster_gap=DEFAULT_CLUSTER_GAP_PX, min_size=PLASTID_MIN_SIZE_PX),
 }
 
 all_fovs = group_fovs(INPUT_DIR)
@@ -206,6 +231,94 @@ def get_cells_for_fov(fov_idx):
         cells = [(ys, xs) for ys, xs, _props in accepted_cells(labeled, n, dic_corr.shape)]
         _fov_cells_cache[fov_idx] = cells
     return _fov_cells_cache[fov_idx]
+
+
+_skeleton_cache = {}  # (fov_idx, cell_idx) -> dict
+
+
+def find_tips_with_coords(skel):
+    """Same double-BFS-sweep diameter heuristic as quantify_cells._find_tips
+    (robust to blunt/sharp tip skeletonization artifacts -- see that function's
+    docstring), but also returns the tip coordinates themselves, needed here to
+    draw them; the production version only returns the two distance maps."""
+    any_point = tuple(np.argwhere(skel)[0])
+    dist_any = _geodesic_distances(skel, any_point)
+    tip_a = tuple(np.unravel_index(np.argmax(np.where(skel, dist_any, -1)), skel.shape))
+    dist_a = _geodesic_distances(skel, tip_a)
+    tip_b = tuple(np.unravel_index(np.argmax(np.where(skel, dist_a, -1)), skel.shape))
+    dist_b = _geodesic_distances(skel, tip_b)
+    return tip_a, dist_a, tip_b, dist_b
+
+
+def compute_cell_skeleton(fov_idx, cell_idx):
+    """The cell's own DIC-derived skeleton -- identical construction to
+    has_body_branch's (same prune_skeleton/SKELETON_PRUNE_ITER), reused here to
+    give plastid peaks a curvature-tolerant coordinate system (arc-length along
+    the cell's centerline, and which side of it) instead of raw XY. Cached per
+    (fov_idx, cell_idx) since it depends only on the cell's mask, not on any
+    channel/threshold parameter."""
+    key = (fov_idx, cell_idx)
+    if key not in _skeleton_cache:
+        ys, xs = get_cells_for_fov(fov_idx)[cell_idx]
+        y0, x0 = int(ys.min()), int(xs.min())
+        local_mask = np.zeros((int(ys.max()) - y0 + 3, int(xs.max()) - x0 + 3), dtype=bool)
+        local_mask[ys - y0 + 1, xs - x0 + 1] = True
+        skel = prune_skeleton(skeletonize(local_mask), SKELETON_PRUNE_ITER)
+        tip_a, dist_a, tip_b, dist_b = find_tips_with_coords(skel)
+        _skeleton_cache.clear()
+        _skeleton_cache[key] = dict(skel=skel, tip_a=tip_a, tip_b=tip_b, dist_a=dist_a, dist_b=dist_b, y0=y0, x0=x0)
+    return _skeleton_cache[key]
+
+
+def project_peaks_onto_skeleton(peak_ys, peak_xs, skel_info):
+    """For each peak (full-image coords), find the nearest skeleton pixel and
+    return its arc-length (geodesic distance from tip A) and signed side (which
+    side of the local skeleton tangent it falls on, via cross product -- +1/-1,
+    or 0 if too close to a tip to estimate a tangent)."""
+    skel, dist_a, y0, x0 = skel_info["skel"], skel_info["dist_a"], skel_info["y0"], skel_info["x0"]
+    skel_ys, skel_xs = np.where(skel)
+    skel_arc = dist_a[skel_ys, skel_xs]
+    arc_lens, sides = [], []
+    for py, px in zip(peak_ys, peak_xs):
+        lpy, lpx = py - y0 + 1, px - x0 + 1
+        d2 = (skel_ys - lpy) ** 2 + (skel_xs - lpx) ** 2
+        i = int(np.argmin(d2))
+        nsy, nsx, arc_len = skel_ys[i], skel_xs[i], skel_arc[i]
+        before = np.where(np.abs(skel_arc - (arc_len - 4)) < 1.5)[0]
+        after = np.where(np.abs(skel_arc - (arc_len + 4)) < 1.5)[0]
+        if len(before) and len(after):
+            ta = (skel_ys[before[0]], skel_xs[before[0]])
+            tb = (skel_ys[after[0]], skel_xs[after[0]])
+            tangent = np.array([tb[0] - ta[0], tb[1] - ta[1]])
+            radial = np.array([lpy - nsy, lpx - nsx])
+            cross = tangent[0] * radial[1] - tangent[1] * radial[0]
+            side = float(np.sign(cross))
+        else:
+            side = 0.0
+        arc_lens.append(float(arc_len))
+        sides.append(side)
+    return np.array(arc_lens), np.array(sides)
+
+
+def cluster_peaks_by_skeleton(peak_ys, peak_xs, skel_info, cluster_gap_px):
+    """Group peaks into clusters: first by side (+1/-1/0 are each their own
+    bucket), then by arc-length proximity within a side -- a new cluster starts
+    whenever the gap to the previous peak (sorted by arc length) exceeds
+    cluster_gap_px. Returns (cluster_id per peak, arc_lens, sides)."""
+    if len(peak_ys) == 0:
+        return np.array([], dtype=int), np.array([]), np.array([])
+    arc_lens, sides = project_peaks_onto_skeleton(peak_ys, peak_xs, skel_info)
+    order = np.lexsort((arc_lens, sides))
+    cluster_ids = np.zeros(len(peak_ys), dtype=int)
+    next_id = -1
+    prev_side, prev_arc = None, None
+    for idx in order:
+        side, arc = sides[idx], arc_lens[idx]
+        if prev_side is None or side != prev_side or abs(arc - prev_arc) > cluster_gap_px:
+            next_id += 1
+        cluster_ids[idx] = next_id
+        prev_side, prev_arc = side, arc
+    return cluster_ids, arc_lens, sides
 
 
 def height_to_bokeh_y(row_coords, height):
@@ -257,18 +370,22 @@ def rotate_point_for_display(r, c, orig_crop_w, do_rotate):
 # Core computation
 # ---------------------------------------------------------------------------
 
-_geometry_cache = {}  # (fov_idx, cell_idx, channel, sigma, threshold_mult, connectivity, method, min_distance, min_prominence, registration) -> dict
+_geometry_cache = {}  # (fov_idx, cell_idx, channel, sigma, threshold_mult, connectivity, method, min_distance, min_prominence, cluster_gap, registration) -> dict
 
 
 def compute_blob_geometry(fov_idx, cell_idx, channel, sigma, threshold_mult, connectivity, method, min_distance,
-                           min_prominence, registration):
+                           min_prominence, cluster_gap, registration):
     """Run the actual count_bright_blobs algorithm (same math, parametrized) and
     compute per-blob geometry once. Independent of the min-size filter value.
-    method is "threshold" or "watershed" (production's current method -- see
-    module docstring). registration=True applies correct_fluorescence_registration
-    before anything else, matching quantify_cells_shifted.py."""
+    method is "threshold", "watershed" (production's current method), or
+    "skeleton" (prototype -- see module docstring: peaks detected the same way as
+    "watershed", then grouped by which side of the cell's own skeleton they fall
+    on and how close together they are along it, before building watershed
+    markers -- one marker per GROUP instead of one per raw peak).
+    registration=True applies correct_fluorescence_registration before anything
+    else, matching quantify_cells_shifted.py."""
     key = (fov_idx, cell_idx, channel, sigma, threshold_mult, connectivity, method, min_distance, min_prominence,
-           registration)
+           cluster_gap, registration)
     if key in _geometry_cache:
         return _geometry_cache[key]
 
@@ -286,8 +403,9 @@ def compute_blob_geometry(fov_idx, cell_idx, channel, sigma, threshold_mult, con
     cell_mask[ys, xs] = True
     bright_mask = cell_mask & (smooth > thresh * threshold_mult)
 
-    peak_ys, peak_xs = np.array([], dtype=int), np.array([], dtype=int)
-    if method == "watershed":
+    peak_ys, peak_xs, cluster_ids = np.array([], dtype=int), np.array([], dtype=int), np.array([], dtype=int)
+    arc_lens, sides = np.array([]), np.array([])
+    if method in ("watershed", "skeleton"):
         # Prominence (topographic: how deep is the valley to the nearest equal-or-
         # higher peak) is a non-spatial complement to min_distance -- see
         # quantify_cells.count_bright_blobs' docstring for the full explanation.
@@ -300,8 +418,14 @@ def compute_blob_geometry(fov_idx, cell_idx, channel, sigma, threshold_mult, con
             labeled, n = ndi.label(bright_mask, structure=structure)
         else:
             peak_ys, peak_xs = coords[:, 0], coords[:, 1]
+            if method == "skeleton":
+                skel_info = compute_cell_skeleton(fov_idx, cell_idx)
+                cluster_ids, arc_lens, sides = cluster_peaks_by_skeleton(peak_ys, peak_xs, skel_info, cluster_gap)
+                marker_ids = cluster_ids + 1  # one marker value per CLUSTER, not per raw peak
+            else:
+                marker_ids = np.arange(1, len(coords) + 1)
             markers = np.zeros(smooth.shape, dtype=int)
-            markers[peak_ys, peak_xs] = np.arange(1, len(coords) + 1)
+            markers[peak_ys, peak_xs] = marker_ids
             ws_connectivity = 2 if connectivity == 8 else 1
             labeled = watershed(-smooth, markers=markers, mask=bright_mask, connectivity=ws_connectivity)
             n = int(labeled.max())
@@ -328,6 +452,7 @@ def compute_blob_geometry(fov_idx, cell_idx, channel, sigma, threshold_mult, con
         crop_bounds=(r0, r1, c0, c1),
         thresh=thresh, n_raw_blobs=n, blobs=blobs, truncated=truncated,
         cell_ys=ys, cell_xs=xs, peak_ys=peak_ys, peak_xs=peak_xs,
+        cluster_ids=cluster_ids, arc_lens=arc_lens, sides=sides,
     )
     _geometry_cache.clear()  # only ever need the current structural setting
     _geometry_cache[key] = result
@@ -369,6 +494,8 @@ smooth_src = ColumnDataSource(data=dict(image=[np.zeros((1, 1))], dw=[1], dh=[1]
 mask_src = ColumnDataSource(data=dict(image=[np.zeros((1, 1))], dw=[1], dh=[1]))
 cell_outline_src = ColumnDataSource(data=dict(xs=[], ys=[]))
 peaks_src = ColumnDataSource(data=dict(x=[], y=[]))
+skeleton_src = ColumnDataSource(data=dict(x=[], y=[]))
+skeleton_tips_src = ColumnDataSource(data=dict(x=[], y=[]))
 
 dic_mapper = LinearColorMapper(palette="Greys256", low=0, high=1)
 channel_mapper = LinearColorMapper(palette="Viridis256", low=0, high=1)
@@ -376,6 +503,9 @@ mask_mapper = LinearColorMapper(palette="Greys256", low=0, high=1)
 
 dic_fig.image(image="image", x=0, y=0, dw="dw", dh="dh", source=dic_src, color_mapper=dic_mapper)
 dic_fig.line(x="xs", y="ys", source=cell_outline_src, color="#3366CC", line_width=2)
+dic_fig.scatter(x="x", y="y", source=skeleton_src, marker="circle", size=3, fill_color="cyan", line_color=None)
+dic_fig.scatter(x="x", y="y", source=skeleton_tips_src, marker="triangle", size=12, fill_color="lime", line_color="black")
+dic_fig.scatter(x="x", y="y", source=peaks_src, marker="x", size=10, line_color="red", line_width=2)
 raw_fig.image(image="image", x=0, y=0, dw="dw", dh="dh", source=raw_src, color_mapper=channel_mapper)
 smooth_fig.image(image="image", x=0, y=0, dw="dw", dh="dh", source=smooth_src, color_mapper=channel_mapper)
 mask_fig.image(image="image", x=0, y=0, dw="dw", dh="dh", source=mask_src, color_mapper=mask_mapper)
@@ -411,6 +541,7 @@ next_button = Button(label="Next cell >", width=115)
 reset_button = Button(label="Reset to calibrated defaults", button_type="primary", width=200)
 status_div = Div(text="", sizing_mode="stretch_width", styles=FULL_WIDTH_TEXT_STYLE)
 warning_div = Div(text="", sizing_mode="stretch_width", styles=FULL_WIDTH_TEXT_STYLE)
+skeleton_info_div = Div(text="", sizing_mode="stretch_width", styles=FULL_WIDTH_TEXT_STYLE)
 
 channel_toggle = RadioButtonGroup(labels=CHANNEL_LABELS, active=0, width=400)
 registration_toggle = RadioButtonGroup(
@@ -422,8 +553,8 @@ connectivity_toggle = RadioButtonGroup(
     active=0, width=400,
 )
 method_toggle = RadioButtonGroup(
-    labels=["Simple threshold", "Watershed (production default)"],
-    active=1, width=400,
+    labels=["Simple threshold", "Watershed (production default)", "Watershed, skeleton-clustered (prototype)"],
+    active=1, width=600,
 )
 
 
@@ -440,7 +571,7 @@ def connectivity_value():
 
 
 def method_value():
-    return "watershed" if method_toggle.active == 1 else "threshold"
+    return ["threshold", "watershed", "skeleton"][method_toggle.active]
 
 
 # structural (expensive -- value_throttled, fires on release only)
@@ -452,6 +583,8 @@ watershed_min_distance_slider = Slider(title="Watershed minimum peak distance (p
                                         value=LIPID_WATERSHED_MIN_DISTANCE_PX, step=1, width=340)
 watershed_min_prominence_slider = Slider(title="Watershed minimum peak prominence (intensity units)", start=0, end=1500,
                                           value=LIPID_WATERSHED_MIN_PROMINENCE, step=10, width=340)
+skeleton_cluster_gap_slider = Slider(title="Skeleton cluster gap (px, prototype)", start=1, end=60,
+                                      value=DEFAULT_CLUSTER_GAP_PX, step=1, width=340)
 
 # filter (cheap -- live value, updates while dragging)
 min_size_slider = Slider(title="Minimum blob size (px^2)", start=BLOB_FLOOR_PX, end=100,
@@ -468,9 +601,10 @@ def current_geometry():
     connectivity, method = connectivity_value(), method_value()
     min_distance = watershed_min_distance_slider.value
     min_prominence = watershed_min_prominence_slider.value
+    cluster_gap = skeleton_cluster_gap_slider.value
     registration = registration_value()
     return compute_blob_geometry(fov_idx, cell_idx, channel, sigma, threshold_mult, connectivity, method,
-                                  min_distance, min_prominence, registration)
+                                  min_distance, min_prominence, cluster_gap, registration)
 
 
 def apply_filters_and_render():
@@ -530,6 +664,19 @@ def apply_filters_and_render():
         f"min prominence: {min_prominence:.0f})"
     )
 
+    if method == "skeleton" and len(geom["peak_ys"]):
+        n_clusters = len(set(geom["cluster_ids"].tolist()))
+        rows_txt = "; ".join(
+            f"peak{i + 1}: arc={arc:.0f}px side={side:+.0f} &rarr; cluster {cid}"
+            for i, (arc, side, cid) in enumerate(zip(geom["arc_lens"], geom["sides"], geom["cluster_ids"]))
+        )
+        skeleton_info_div.text = (
+            f"<b>Skeleton clustering:</b> {len(geom['peak_ys'])} raw peak(s) &rarr; "
+            f"<b>{n_clusters} cluster(s)</b> (gap={skeleton_cluster_gap_slider.value:.0f}px). {rows_txt}"
+        )
+    else:
+        skeleton_info_div.text = ""
+
 
 def render_static_panels():
     channel = channel_value()
@@ -581,6 +728,25 @@ def render_static_panels():
     else:
         peaks_src.data = dict(x=[], y=[])
 
+    if method_value() == "skeleton":
+        skel_info = compute_cell_skeleton(current_fov_idx[0], current_cell_idx[0])
+        skel_ys_local, skel_xs_local = np.where(skel_info["skel"])
+        # skeleton pixels are in ITS OWN local-crop frame (offset by y0-1/x0-1 from
+        # full-image coords) -- convert to full-image, then to this app's crop-
+        # relative frame, before the usual rotate + Bokeh-y-flip.
+        skel_r_full = skel_ys_local + skel_info["y0"] - 1
+        skel_c_full = skel_xs_local + skel_info["x0"] - 1
+        skel_r, skel_c = rotate_point_for_display(skel_r_full - r0, skel_c_full - c0, crop_w, do_rotate)
+        skeleton_src.data = dict(x=skel_c.tolist(), y=height_to_bokeh_y(skel_r, disp_h).tolist())
+
+        tip_rs_full = np.array([skel_info["tip_a"][0], skel_info["tip_b"][0]]) + skel_info["y0"] - 1
+        tip_cs_full = np.array([skel_info["tip_a"][1], skel_info["tip_b"][1]]) + skel_info["x0"] - 1
+        tip_r, tip_c = rotate_point_for_display(tip_rs_full - r0, tip_cs_full - c0, crop_w, do_rotate)
+        skeleton_tips_src.data = dict(x=tip_c.tolist(), y=height_to_bokeh_y(tip_r, disp_h).tolist())
+    else:
+        skeleton_src.data = dict(x=[], y=[])
+        skeleton_tips_src.data = dict(x=[], y=[])
+
 
 def show_cell(fov_idx, cell_idx):
     fov_idx = max(0, min(len(fov_items) - 1, fov_idx))
@@ -620,6 +786,7 @@ def on_channel_change(attr, old, new):
     threshold_mult_slider.value = defaults["threshold_mult"]
     watershed_min_distance_slider.value = defaults["min_distance"]
     watershed_min_prominence_slider.value = defaults["min_prominence"]
+    skeleton_cluster_gap_slider.value = defaults["cluster_gap"]
     min_size_slider.value = defaults["min_size"]
     render_static_panels()
     apply_filters_and_render()
@@ -674,6 +841,7 @@ def on_reset():
     threshold_mult_slider.value = defaults["threshold_mult"]
     watershed_min_distance_slider.value = defaults["min_distance"]
     watershed_min_prominence_slider.value = defaults["min_prominence"]
+    skeleton_cluster_gap_slider.value = defaults["cluster_gap"]
     min_size_slider.value = defaults["min_size"]
     render_static_panels()
     apply_filters_and_render()
@@ -689,7 +857,8 @@ registration_toggle.on_change("active", on_structural_change)
 connectivity_toggle.on_change("active", on_structural_change)
 method_toggle.on_change("active", on_structural_change)
 
-for slider in (sigma_slider, threshold_mult_slider, watershed_min_distance_slider, watershed_min_prominence_slider):
+for slider in (sigma_slider, threshold_mult_slider, watershed_min_distance_slider, watershed_min_prominence_slider,
+               skeleton_cluster_gap_slider):
     slider.on_change("value_throttled", on_structural_change)
 
 min_size_slider.on_change("value", on_filter_change)
@@ -734,6 +903,7 @@ structural_col = column(
     connectivity_toggle,
     method_toggle,
     sigma_slider, threshold_mult_slider, watershed_min_distance_slider, watershed_min_prominence_slider,
+    skeleton_cluster_gap_slider,
     styles=WHITE_STYLE,
 )
 filter_col = column(
@@ -748,6 +918,7 @@ layout = column(
     row(fov_select, cell_select, sizing_mode="stretch_width"),
     status_div,
     warning_div,
+    skeleton_info_div,
     row(structural_col, filter_col, sizing_mode="stretch_width"),
     row(dic_fig, raw_fig, smooth_fig, mask_fig, result_fig, sizing_mode="stretch_width"),
     sizing_mode="stretch_width",
