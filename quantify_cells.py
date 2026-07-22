@@ -65,6 +65,17 @@ normally carries a single plastid that duplicates before the cell divides, so
 >1 detected plastid is a candidate marker for a dividing cell -- this hasn't
 been validated against any ground-truth dividing-cell annotation yet.
 
+count_bright_blobs' watershed peak search is restricted to the DIC-derived
+cell mask, which assumes the fluorescence channel is already registered to
+DIC. This script's own main() does NOT apply that registration correction (see
+quantify_cells_shifted.py, which does, via correct_fluorescence_registration
+below) -- without it, a real peak that sits just past the mask edge (most
+likely near a cell's tapered tip, where the mask is narrowest) gets clipped
+and reported at the mask boundary instead of its true location. Confirmed on
+this dataset: a plastid's true peak sat 11px outside the mask at exactly the
+point where the mask tapered, and applying the calibrated registration shift
+moved it into a part of the mask over 100px wide, resolving the clip.
+
 Use --days/--reps to restrict the analysis to specific Day/replicate numbers,
 parsed from the "<Condition>_Day<N>_rep<M>" filename prefix (e.g. to analyze
 only Day 3 replicates 1-2, pass --days 3 --reps 1,2). This changes ONLY which
@@ -130,6 +141,20 @@ PLASTID_SMOOTH_SIGMA = 1.0
 PLASTID_MIN_SIZE_PX = 3
 PLASTID_WATERSHED_MIN_DISTANCE_PX = 3
 
+# Fluorescence-to-DIC registration offset -- the outlier-trimmed median of per-cell
+# centroid offsets between DIC-derived chloroplast position and Chlorophyll-channel
+# autofluorescence centroid, computed across all 188 cells (see
+# quantify_cells_shifted.py, the script this was originally calibrated in). Applied
+# to both Chlorophyll and BODIPY under the assumption they share the fluorescence
+# path's offset -- unverified for BODIPY specifically, since it has no DIC-visible
+# structural analog. Without this correction, a peak-finding search restricted to
+# the DIC-derived cell mask (e.g. count_bright_blobs' watershed seeding) can clip a
+# real fluorescence peak that sits just past the mask edge, particularly near a
+# cell's tapered tip where the mask is narrowest -- confirmed on this dataset (see
+# project conversation).
+FLUORESCENCE_SHIFT_DY_PX = 7
+FLUORESCENCE_SHIFT_DX_PX = -1
+
 CONDITION_ORDER = ["Nitrate", "Arginine", "Urea"]
 
 
@@ -164,6 +189,16 @@ def correct_dic_background(dic_img, background):
     level, flattening stationary artifacts while leaving genuine per-FOV structure
     (real illumination, real cells) untouched."""
     return dic_img.astype(np.float64) - (background - np.median(background))
+
+
+def correct_fluorescence_registration(channel_img):
+    """Translate a fluorescence channel (Chlorophyll or BODIPY) by the calibrated
+    offset that aligns it to the DIC-derived cell mask -- see
+    FLUORESCENCE_SHIFT_DY_PX/FLUORESCENCE_SHIFT_DX_PX above for how this was
+    measured and why it matters for anything that searches within the DIC mask
+    (e.g. count_bright_blobs' watershed peak seeding)."""
+    return ndi.shift(channel_img.astype(np.float64),
+                      shift=(FLUORESCENCE_SHIFT_DY_PX, FLUORESCENCE_SHIFT_DX_PX), order=1)
 
 
 def segment_dic(dic_img):

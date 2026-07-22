@@ -21,6 +21,15 @@ The same correction is applied to BODIPY under the assumption it shares the
 fluorescence path's offset; this is unverified for BODIPY specifically, since
 it has no DIC-visible structural analog.
 
+This registration correction matters beyond just the raw fluorescence sums:
+count_lipid_bodies/count_plastids (quantify_cells.py) search for watershed
+seeds only within the DIC-derived cell mask, so a real intensity peak sitting
+just past the mask edge -- most likely near a cell's tapered tip, where the
+mask is narrowest -- gets clipped and reported at the wrong location if the
+fluorescence channel isn't first brought into registration with DIC. This is
+why n_plastids/n_lipid_bodies are computed here from the shift-corrected
+channels, not quantify_cells.py's uncorrected ones.
+
 Use --days/--reps to restrict to specific Day/replicate numbers (same
 behavior as quantify_cells.py's --days/--reps -- see that script's docstring).
 """
@@ -38,11 +47,12 @@ import scipy.ndimage as ndi
 
 from quantify_cells import (
     CHANNELS, segment_dic, accepted_cells, group_fovs,
-    count_lipid_bodies, LIPID_SMOOTH_SIGMA, CONDITION_ORDER, make_categorical_plot,
-    parse_int_list, filter_fovs_by_day_rep,
+    count_lipid_bodies, count_plastids, LIPID_SMOOTH_SIGMA, PLASTID_SMOOTH_SIGMA,
+    FLUORESCENCE_SHIFT_DY_PX, FLUORESCENCE_SHIFT_DX_PX,
+    CONDITION_ORDER, make_categorical_plot, parse_int_list, filter_fovs_by_day_rep,
 )
 
-SHIFT_DY, SHIFT_DX = 7, -1
+SHIFT_DY, SHIFT_DX = FLUORESCENCE_SHIFT_DY_PX, FLUORESCENCE_SHIFT_DX_PX
 
 
 def main():
@@ -79,6 +89,7 @@ def main():
         labeled, n_components = segment_dic(dic)
         cells = list(accepted_cells(labeled, n_components, dic.shape))
         bod_corr_smooth = ndi.gaussian_filter(bod_corr, sigma=LIPID_SMOOTH_SIGMA)
+        chl_corr_smooth = ndi.gaussian_filter(chl_corr, sigma=PLASTID_SMOOTH_SIGMA)
 
         for cell_id, (ys, xs, props) in enumerate(cells, start=1):
             total_chl, total_bod = chl_corr[ys, xs].sum(), bod_corr[ys, xs].sum()
@@ -89,6 +100,7 @@ def main():
                 avg_chlorophyll=total_chl / props["area_px"],
                 avg_bodipy=total_bod / props["area_px"],
                 n_lipid_bodies=count_lipid_bodies(bod_corr_smooth, ys, xs),
+                n_plastids=count_plastids(chl_corr_smooth, ys, xs),
             ))
 
     df = pd.DataFrame(rows)
@@ -103,6 +115,8 @@ def main():
                            os.path.join(args.output_dir, "bodipy_per_cell_shift_corrected.png"))
     make_categorical_plot(df, "n_lipid_bodies", "Number of lipid bodies per cell (shift-corrected)",
                            os.path.join(args.output_dir, "lipid_bodies_per_cell_shift_corrected.png"))
+    make_categorical_plot(df, "n_plastids", "Number of plastids per cell (shift-corrected)",
+                           os.path.join(args.output_dir, "plastids_per_cell_shift_corrected.png"))
     print(f"Saved plots to {args.output_dir}")
 
 

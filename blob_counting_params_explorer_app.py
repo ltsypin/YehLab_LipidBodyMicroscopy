@@ -51,6 +51,19 @@ exploring one channel never leaves stale, wrong-channel parameter values in
 place for the other. Use this app to find a Chlorophyll-appropriate
 min-distance before trusting n_plastids for anything.
 
+A "registration correction" toggle controls whether the fluorescence channel
+is translated by the calibrated DIC-alignment offset
+(quantify_cells.correct_fluorescence_registration) before anything else runs.
+Watershed peak-seeding is restricted to the DIC-derived cell mask, so if the
+fluorescence channel isn't registered to DIC first, a real peak sitting just
+past the mask edge -- most likely near a cell's tapered tip, where the mask
+is narrowest -- gets clipped and reported at the wrong location. Confirmed on
+this dataset (see project conversation): in Arginine_Day3_rep2FOV2 cell 2,
+the true peak of one plastid sat 11px outside the mask, at exactly the point
+where the mask tapered toward the cell's tip; with the correction on, that
+same peak lands in a part of the mask over 100px wide instead. This is now
+on by default, matching quantify_cells_shifted.py.
+
 Detected watershed peaks are drawn as x marks on panels d and e.
 
 Navigation is two-level: pick a field of view, then step through that FOV's
@@ -107,7 +120,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from quantify_cells import (
     group_fovs, segment_dic, accepted_cells, otsu_threshold, UM_PER_PX,
-    compute_dic_background, correct_dic_background,
+    compute_dic_background, correct_dic_background, correct_fluorescence_registration,
     LIPID_SMOOTH_SIGMA, LIPID_MIN_SIZE_PX, LIPID_WATERSHED_MIN_DISTANCE_PX,
     PLASTID_SMOOTH_SIGMA, PLASTID_MIN_SIZE_PX, PLASTID_WATERSHED_MIN_DISTANCE_PX,
 )
@@ -215,20 +228,23 @@ def crop_bounds(ys, xs, shape, pad=CROP_PAD_PX):
 # Core computation
 # ---------------------------------------------------------------------------
 
-_geometry_cache = {}  # (fov_idx, cell_idx, channel, sigma, threshold_mult, connectivity, method, min_distance) -> dict
+_geometry_cache = {}  # (fov_idx, cell_idx, channel, sigma, threshold_mult, connectivity, method, min_distance, registration) -> dict
 
 
-def compute_blob_geometry(fov_idx, cell_idx, channel, sigma, threshold_mult, connectivity, method, min_distance):
+def compute_blob_geometry(fov_idx, cell_idx, channel, sigma, threshold_mult, connectivity, method, min_distance, registration):
     """Run the actual count_bright_blobs algorithm (same math, parametrized) and
     compute per-blob geometry once. Independent of the min-size filter value.
     method is "threshold" or "watershed" (production's current method -- see
-    module docstring)."""
-    key = (fov_idx, cell_idx, channel, sigma, threshold_mult, connectivity, method, min_distance)
+    module docstring). registration=True applies correct_fluorescence_registration
+    before anything else, matching quantify_cells_shifted.py."""
+    key = (fov_idx, cell_idx, channel, sigma, threshold_mult, connectivity, method, min_distance, registration)
     if key in _geometry_cache:
         return _geometry_cache[key]
 
     ys, xs = get_cells_for_fov(fov_idx)[cell_idx]
     raw = load_channel(fov_idx, channel)
+    if registration:
+        raw = correct_fluorescence_registration(raw)
     height, width = raw.shape
     r0, r1, c0, c1 = crop_bounds(ys, xs, (height, width))
 
@@ -360,6 +376,10 @@ status_div = Div(text="", sizing_mode="stretch_width", styles=FULL_WIDTH_TEXT_ST
 warning_div = Div(text="", sizing_mode="stretch_width", styles=FULL_WIDTH_TEXT_STYLE)
 
 channel_toggle = RadioButtonGroup(labels=CHANNEL_LABELS, active=0, width=400)
+registration_toggle = RadioButtonGroup(
+    labels=["With registration correction (production default)", "Without correction (raw channel)"],
+    active=0, width=400,
+)
 connectivity_toggle = RadioButtonGroup(
     labels=["8-connected (production default)", "4-connected"],
     active=0, width=400,
@@ -372,6 +392,10 @@ method_toggle = RadioButtonGroup(
 
 def channel_value():
     return "BODIPY" if channel_toggle.active == 0 else "Chlorophyll"
+
+
+def registration_value():
+    return registration_toggle.active == 0
 
 
 def connectivity_value():
@@ -404,7 +428,9 @@ def current_geometry():
     sigma, threshold_mult = sigma_slider.value, threshold_mult_slider.value
     connectivity, method = connectivity_value(), method_value()
     min_distance = watershed_min_distance_slider.value
-    return compute_blob_geometry(fov_idx, cell_idx, channel, sigma, threshold_mult, connectivity, method, min_distance)
+    registration = registration_value()
+    return compute_blob_geometry(fov_idx, cell_idx, channel, sigma, threshold_mult, connectivity, method,
+                                  min_distance, registration)
 
 
 def apply_filters_and_render():
@@ -452,8 +478,8 @@ def apply_filters_and_render():
     )
     status_div.text = (
         f"<b>{prefix}FOV{fov_num}</b> &mdash; cell {cell_idx + 1} of {n_cells} in this FOV &mdash; "
-        f"channel: <b>{channel}</b> &mdash; "
-        f"per-cell Otsu threshold (smoothed): {geom['thresh']:.1f} &times; {threshold_mult:.2f} "
+        f"channel: <b>{channel}</b> &mdash; registration correction: <b>{'ON' if registration_value() else 'OFF'}</b> "
+        f"&mdash; per-cell Otsu threshold (smoothed): {geom['thresh']:.1f} &times; {threshold_mult:.2f} "
         f"&mdash; {geom['n_raw_blobs']} raw bright blob(s) &mdash; "
         f"<b>{n_counted} {blob_word}</b> "
         f"(&ge; {min_size:.0f}px, {connectivity}-connected, method: {method})"
@@ -590,6 +616,7 @@ def on_cell_select(attr, old, new):
 
 def on_reset():
     channel_toggle.active = 0
+    registration_toggle.active = 0
     connectivity_toggle.active = 0
     method_toggle.active = 1
     defaults = CHANNEL_DEFAULTS["BODIPY"]
@@ -607,6 +634,7 @@ fov_select.on_change("value", on_fov_select)
 cell_select.on_change("value", on_cell_select)
 reset_button.on_click(on_reset)
 channel_toggle.on_change("active", on_channel_change)
+registration_toggle.on_change("active", on_structural_change)
 connectivity_toggle.on_change("active", on_structural_change)
 method_toggle.on_change("active", on_structural_change)
 
@@ -618,15 +646,20 @@ min_size_slider.on_change("value", on_filter_change)
 instructions = Div(text=(
     "<p><b>Channel</b> picks BODIPY (lipid bodies) or Chlorophyll (plastids); switching "
     "it resets the sliders below to that channel's own defaults, so stale parameters "
-    "from the other channel never carry over. Production's actual current method is "
-    "<b>watershed</b> (the default here) -- <b>Simple threshold</b> is kept for "
-    "comparison, matching the pre-watershed behavior. <b>Structural</b> parameters "
-    "(sigma, threshold multiplier, connectivity, watershed peak distance) re-run "
-    "thresholding and labeling on release; the <b>filter</b> parameter (minimum blob "
-    "size) just re-checks the already-labeled blobs, live while dragging. Panel e colors "
-    "every blob green (counted) or red (below the size cutoff) -- hover for its exact "
-    "size. Panel a shows the DIC channel with this cell's own mask outline, for "
-    "orientation only -- the DIC segmentation itself is fixed here; explore it with "
+    "from the other channel never carry over. <b>Registration correction</b> translates "
+    "the fluorescence channel to align with DIC before anything else runs (matches "
+    "quantify_cells_shifted.py) -- watershed peak-seeding is restricted to the "
+    "DIC-derived mask, so without this a real peak near a cell's tapered tip can fall "
+    "just outside the mask and get reported at the wrong location; toggle it off to see "
+    "the difference directly. Production's actual current method is <b>watershed</b> "
+    "(the default here) -- <b>Simple threshold</b> is kept for comparison, matching the "
+    "pre-watershed behavior. <b>Structural</b> parameters (channel, registration, sigma, "
+    "threshold multiplier, connectivity, watershed peak distance) re-run thresholding "
+    "and labeling on release; the <b>filter</b> parameter (minimum blob size) just "
+    "re-checks the already-labeled blobs, live while dragging. Panel e colors every blob "
+    "green (counted) or red (below the size cutoff) -- hover for its exact size. Panel a "
+    "shows the DIC channel with this cell's own mask outline, for orientation only -- "
+    "the DIC segmentation itself is fixed here; explore it with "
     "segmentation_params_explorer_app.py instead. Prev/Next cell rolls into the "
     "neighboring FOV once you run off either end. Panels a-e share pan/zoom. Watershed "
     "mode marks detected intensity peaks with x's on panels d/e -- a blob with 2+ peaks "
@@ -639,6 +672,7 @@ instructions = Div(text=(
 structural_col = column(
     Div(text="<b>Structural (expensive -- updates on release)</b>", styles=WHITE_STYLE),
     channel_toggle,
+    registration_toggle,
     connectivity_toggle,
     method_toggle,
     sigma_slider, threshold_mult_slider, watershed_min_distance_slider,
