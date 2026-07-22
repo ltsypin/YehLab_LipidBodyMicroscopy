@@ -38,6 +38,8 @@ quantify_cells.py
 quantify_cells_dilated.py     (rejected approach, kept for reference — see Step 4)
 quantify_cells_shifted.py     (adopted approach — see Step 4)
 qc_review_app.py             (interactive segmentation QC tool — see "QC review tool" below)
+segmentation_params_explorer_app.py    (interactive Step 3 segmentation tuning — see "Interactive parameter-exploration tools" below)
+blob_counting_params_explorer_app.py   (interactive lipid-body/plastid counting tuning — see "Interactive parameter-exploration tools" below)
 ```
 
 Raw `.liff` files and their derived TIFF exports are grouped into a
@@ -156,6 +158,21 @@ python quantify_cells.py <input_dir> <output_dir> [--qc-overlays] [--days 3] [--
 
 ### Segmentation (classical CV, DIC channel only)
 
+0. **Fixed-pattern background correction** (`compute_dic_background` /
+   `correct_dic_background`), applied before anything else: a per-pixel
+   *median* across every DIC image in `input_dir` (always the full
+   directory, regardless of any `--days`/`--reps` filter — this estimates a
+   stationary instrument artifact, not biology). Real cells occupy different
+   pixels from FOV to FOV and get suppressed by the median, while a
+   stationary optical artifact (an out-of-focus dust speck, in this dataset)
+   survives at the same pixel location in every FOV and gets isolated.
+   Confirmed **DIC-specific** — not present in Chlorophyll/BODIPY at the same
+   pixel location — so the correction is applied only to the DIC image fed
+   into segmentation, never to the fluorescence channels used for
+   quantification. Left uncorrected, the artifact's edge ring could get
+   pulled into a real cell's mask during the closing step below if the cell
+   happened to sit near it, distorting that cell's fitted shape. This fix
+   alone changed the accepted-cell count from 188 to 194 on this dataset.
 1. Light Gaussian smoothing (σ=1.0) → Sobel gradient magnitude → Otsu
    threshold (self-implemented, vectorized histogram method — no
    scikit-image) × 0.4 → morphological closing (disk radius 10px; bridges
@@ -174,7 +191,20 @@ python quantify_cells.py <input_dir> <output_dir> [--qc-overlays] [--days 3] [--
      before narrowing the range — if you get zero or very few detections on
      new data, check this first.
    - **solidity ≥ 0.75** (mask area / convex hull area), to reject
-     non-convex/branching shapes.
+     non-convex/branching shapes — **or**, if solidity fails, a second chance
+     via `has_body_branch`: skeletonize the component's mask, find its two
+     tips by geodesic (along-skeleton) distance (robust to curvature, and to
+     both sharp- and blunt-tip skeletonization artifacts), and check whether
+     any skeleton branch point sits far (> `SKELETON_TIP_MARGIN_PX` = 20px)
+     from both tips. A bent-but-otherwise-clean fusiform cell's skeleton has
+     no such branch — straight-line solidity penalizes it purely for
+     curving, not for anything actually wrong — while a genuinely malformed
+     component (two cells merged, debris fused on) does have one. This can
+     only *add* acceptances, never remove one: anything that already passes
+     the plain solidity cutoff is accepted regardless of its skeleton. This
+     rescue changed the accepted-cell count from 194 to 209 on this dataset
+     (i.e. it, not the background fix above, accounts for most of the total
+     188→209 change since the two fixes were calibrated).
    - **not touching the image border.**
    - minimum component area 300 px² (drops speckle noise before the
      (relatively expensive) ellipse/hull fitting).
@@ -207,29 +237,153 @@ detectors were tried and **both rejected**:
 `sample`, `fov`, `cell_id`, `area_px`, `length_um`, `width_um`,
 `aspect_ratio`, `solidity`, `total_chlorophyll` / `total_bodipy` (sum of raw
 pixel intensity in the tight cell mask), `avg_chlorophyll` / `avg_bodipy`
-(total ÷ `area_px`, i.e. mean intensity per pixel), `n_lipid_bodies`.
+(total ÷ `area_px`, i.e. mean intensity per pixel), `n_lipid_bodies`,
+`n_plastids`, `chlorophyll_focus_score`, `in_focus`.
 
-**Lipid body counting**: Gaussian-smooth the BODIPY channel (σ=1.0) →
-per-cell Otsu threshold computed only on that cell's own pixels → connected
-components of the resulting bright mask, keeping only components ≥3 px →
-count = number of surviving components.
-**Known limitation**: droplets that touch/overlap enough to merge into one
-connected component are undercounted as a single lipid body. A
-local-maxima peak-splitting alternative was tried and rejected: a small
-peak-detection footprint produced spurious extra peaks from pixel noise
-inside a single droplet; a larger footprint just recreated the same
-undercounting problem it was meant to fix. The simple, predictable
-connected-component count was kept.
+**Lipid body / plastid counting (watershed)**: both use the same function,
+`count_bright_blobs` — Gaussian-smooth the channel (σ=1.0) → per-cell Otsu
+threshold computed only on that cell's own pixels → **watershed-split** the
+resulting bright mask at local intensity peaks
+(`skimage.feature.peak_local_max` + `skimage.segmentation.watershed`) →
+count connected components ≥3 px in the *split* result. `count_lipid_bodies`
+(BODIPY) and `count_plastids` (Chlorophyll) are thin wrappers over it with
+their own constants.
+
+This supersedes plain connected-component counting, which undercounts
+touching blobs whenever the valley between their brightness peaks never dips
+below the per-cell threshold — confirmed on this dataset: a single 1685px
+"blob" in one cell was visibly 2–3 distinct ring-shaped droplets in the raw
+BODIPY. Watershed seeds one marker per local intensity peak and floods
+outward from each, splitting at the ridge between them; a single-peak blob
+watersheds right back to itself, so this can only help merged cases, never
+change an already-distinct count. (An earlier local-maxima peak-splitting
+attempt, tried before proper watershed flooding, was rejected: a small
+peak-detection footprint alone produced spurious extra peaks from pixel
+noise inside one droplet, and a larger footprint just recreated the
+undercounting it was meant to fix — the missing piece was watershed's
+ridge-flooding step, not peak detection by itself.)
+
+Two independent watershed knobs, both exposed per-channel:
+- `watershed_min_distance` (px) — purely spatial non-max-suppression radius;
+  two peaks closer than this always collapse to one. `LIPID_WATERSHED_MIN_DISTANCE_PX = 3`
+  is a confirmed-reasonable default for BODIPY.
+- `watershed_min_prominence` (intensity units, disabled/0 by default) — a
+  complementary, purely topographic criterion via `skimage.morphology.h_maxima`:
+  a peak only survives if there's no path to an equal-or-higher peak along
+  which the intensity drop is smaller than this value. This is what
+  distinguishes two real neighboring blobs (each has its own full-height
+  peak with a genuinely deep valley between them) from one blob with two
+  lobes at slightly different focus/brightness (the dip between them never
+  drops back to background).
+
+**Plastid counting is NOT yet calibrated.** At the current defaults
+(`min_distance=3`, `min_prominence=0`, mirroring BODIPY), >1 plastid is
+detected in ~91% of cells (190 of 209) — not biologically plausible for *P.
+tricornutum*, which normally carries one plastid that duplicates only near
+the end of division (the intended use of `n_plastids` is as a candidate
+dividing-cell marker). A systematic sweep of `sigma`/`min_distance` and of
+`threshold_mult`+`min_prominence` together showed this isn't a matter of
+finding one missed value: no single global-parameter combination satisfies
+two known validation cells at once (`Arginine_Day3_rep2FOV2` cell 2, two
+real close-together plastids, needs `min_distance` around 8; and
+`Arginine_Day3_rep3FOV4` cell 4, a dividing cell near the end of cytokinesis
+whose two plastids should be symmetric about the cell's long axis, breaks
+under every parameter value that fixes the first case). See "Open items"
+and the skeleton-clustering prototype below.
+
+**Chlorophyll focus score** (`compute_focus_score`, `chlorophyll_focus_score`
+column): variance of the Laplacian of the *raw* (unsmoothed) Chlorophyll
+channel within a cell's mask — a standard microscopy autofocus metric
+(in-focus structure has high-frequency detail that blur suppresses).
+Motivation: cells with 0 detected plastids turned out, on inspection, to be
+genuinely out-of-focus cells rather than a counting bug (e.g.
+`Arginine_Day3_rep1FOV3` cell 3) — sharpness of the plastid signal is itself
+a useful QC signal, not just noise to work around. Cross-checked against
+every previously manually-flagged cell in this dataset: all 3 cells flagged
+"out of focus" scored in the 5th–7th percentile dataset-wide, while cells
+flagged for unrelated reasons (incomplete/ragged segmentation) scored
+49th–99th — a clean separation. `in_focus` is just
+`chlorophyll_focus_score >= PLASTID_MIN_FOCUS_SCORE` (580, an informed
+~10th-percentile starting cutoff, not exhaustively validated at the
+boundary); nothing is dropped from the output automatically — filtering on
+`in_focus` is an explicit downstream choice.
+
+**Registration order matters for watershed seeding, not just intensity
+sums.** `count_bright_blobs`' peak search is restricted to the DIC-derived
+cell mask, which assumes the fluorescence channel is already registered to
+DIC (see Step 4). `quantify_cells.py`'s own `main()` does **not** apply that
+correction before counting blobs — it computes `n_lipid_bodies`/`n_plastids`
+from the raw, unregistered channels, so a real peak sitting just past the
+mask edge (most likely near a cell's tapered tip, where the mask is
+narrowest) can get clipped and reported at the wrong location. This was
+caught directly on this dataset: in `Arginine_Day3_rep2FOV2` cell 2, a
+plastid's true peak sat 11px outside the mask, at exactly the point where
+the mask tapered; applying the registration shift moved it into a part of
+the mask over 100px wide, resolving the clip. `quantify_cells_shifted.py`
+(Step 4) applies the registration correction *before* calling
+`count_lipid_bodies`/`count_plastids`, so its blob counts are the
+order-correct ones — prefer those over `quantify_cells.py`'s own
+uncorrected `n_lipid_bodies`/`n_plastids` for any cell near a mask edge.
 
 `--qc-overlays` writes one PNG per FOV to `<output_dir>/qc_overlays/`
 showing which regions were accepted as cells. **Inspect a sample of these
 before trusting results on any new data** — this is how both the length-range
 mismatch and the merged-cell issue above were originally caught.
 
-Default plot: `lipid_bodies_per_cell.png` (categorical scatter, one point per
-cell, x = condition in order `[Nitrate, Arginine, Urea]`, black bar = mean).
-Average/total-intensity plots are *not* produced by this script's `main()` by
-default — see Step 5.
+Default plots: `lipid_bodies_per_cell.png` and `plastids_per_cell.png`
+(categorical scatter, one point per cell, x = condition in order
+`[Nitrate, Arginine, Urea]`, black bar = mean), plus `dic_background.png`
+(the fixed-pattern background map itself). Average/total-intensity plots are
+*not* produced by this script's `main()` by default — see Step 5.
+
+### Interactive parameter-exploration tools
+
+Two Bokeh apps let you tune segmentation/counting parameters live against
+real FOVs and individual cells, instead of editing constants and re-running
+the full pipeline:
+
+```
+bokeh serve --show segmentation_params_explorer_app.py --args <input_dir>
+bokeh serve --show blob_counting_params_explorer_app.py --args <input_dir>
+```
+
+Also registered in `~/ClaudeCowork/.claude/launch.json` as
+`bokeh-segmentation-params` (port 5008) and `bokeh-blob-counting-params`
+(port 5010).
+
+- **`segmentation_params_explorer_app.py`**: sliders for the Step 3
+  DIC-segmentation constants (smoothing σ, threshold multiplier, morphology
+  radii, length/width/aspect/solidity bounds), a DIC-background-correction
+  on/off toggle, and status text that reports when a cell was accepted only
+  via the curvature-tolerant solidity rescue (`has_body_branch`).
+- **`blob_counting_params_explorer_app.py`**: BODIPY/Chlorophyll blob
+  counting, calling `quantify_cells.count_bright_blobs` directly (so it
+  can't drift from the production math). Channel toggle (each with its own
+  remembered defaults), registration-correction toggle (on by default,
+  matching `quantify_cells_shifted.py`), a connectivity toggle, and a 3-way
+  method toggle — plain per-cell threshold, production watershed, or a
+  skeleton-clustered prototype (below) — with sliders for smoothing σ,
+  threshold multiplier, `watershed_min_distance`, `watershed_min_prominence`,
+  and (skeleton method only) cluster gap. Cell crops auto-rotate (cosmetic
+  only, `np.rot90`) so each cell's longer side always displays vertically.
+
+**Prototype, not in production: skeleton-clustered plastid splitting.**
+Neither `min_distance` nor `min_prominence` alone could satisfy both known
+plastid-counting validation cases above. This prototype (in
+`blob_counting_params_explorer_app.py` only, method toggle "Watershed,
+skeleton-clustered") instead reuses the cell's own DIC-derived skeleton
+(identical construction to `has_body_branch`'s) to project every raw
+intensity peak onto a curvature-tolerant coordinate — arc-length along the
+cell's centerline, and which side of it — then clusters peaks by (side,
+arc-length gap ≤ `cluster_gap_px`, default 20px, **untuned**) into one
+watershed marker per cluster instead of one per raw peak. This succeeded on
+both known validation cells where every global-parameter combination failed
+above, because unlike a straight-line long-axis split it tolerates cell
+curvature. **Not yet adopted** into `count_bright_blobs`/`count_plastids`:
+whether a single non-dividing plastid's own internal texture noise could
+land peaks on both skeleton sides and cause a false split has not been
+checked against any known single-plastid cell — decide with the user before
+promoting this to production.
 
 ### QC review tool (`qc_review_app.py`)
 
@@ -372,11 +526,13 @@ python quantify_cells_shifted.py <input_dir> <output_dir> [--shift-dy 7] [--shif
 
 (`quantify_cells_dilated.py` takes the same `--days`/`--reps` flags, plus its own `--dilate-radius`.)
 
-Outputs `cell_measurements_shift_corrected.csv` and
-`{chlorophyll,bodipy,lipid_bodies}_per_cell_shift_corrected.png`. Lipid body
-counts are essentially unaffected by this correction (the per-cell Otsu
-threshold used there is fairly insensitive to a small, correctly-centered
-shift) — it mainly matters for the intensity metrics.
+Outputs `cell_measurements_shift_corrected.csv`,
+`{chlorophyll,bodipy,lipid_bodies,plastids}_per_cell_shift_corrected.png`,
+and `dic_background.png`. Lipid body counts are essentially unaffected by
+this correction (the per-cell Otsu threshold used there is fairly
+insensitive to a small, correctly-centered shift) — it mainly matters for
+the intensity metrics **and** for plastid/lipid-body watershed seeding (see
+below).
 
 **Caveat carried forward**: the same (dy=7, dx=-1) correction, measured from
 Chlorophyll, is also applied to BODIPY, since BODIPY has no DIC-visible
@@ -385,10 +541,29 @@ fluorescence channels share the same optical-path offset relative to DIC
 (plausible — both are captured through what should be a similar path
 immediately after DIC — but **not independently verified**).
 
+**Beyond intensity sums — this correction also matters for watershed peak
+seeding.** `count_lipid_bodies`/`count_plastids` (Step 3) restrict their
+watershed peak search to the DIC-derived cell mask, which assumes the
+fluorescence channel is already in registration with DIC. `quantify_cells.py`
+computes `n_lipid_bodies`/`n_plastids` from the *raw, uncorrected* channels;
+`quantify_cells_shifted.py` computes them from the shift-corrected channels,
+so its blob counts (as well as its intensity sums) are the order-correct
+ones — see the per-cell measurements section of Step 3 for the specific bug
+this fixes.
+
+**`quantify_cells_shifted.py`'s DIC segmentation is now identical to
+`quantify_cells.py`'s** — both apply `compute_dic_background`/
+`correct_dic_background` before `segment_dic`, and `accepted_cells`' shared
+curvature-tolerant solidity rescue applies to both for free. Previously
+`quantify_cells_shifted.py` segmented the *raw* DIC image, so its cell
+population (204 cells) and `cell_id` numbering diverged from
+`quantify_cells.py`'s (209 cells at the time); they now match exactly,
+modulo whatever `--days`/`--reps` filter each run uses.
+
 **This is the recommended pipeline for fluorescence quantification going
-forward** — i.e. Step 3 for segmentation + lipid body counts, Step 4 in
-place of Step 3's raw `avg_chlorophyll`/`avg_bodipy` for anything involving
-fluorescence intensity.
+forward** — i.e. Step 3 for segmentation, Step 4 in place of Step 3's raw
+`avg_chlorophyll`/`avg_bodipy`/`n_lipid_bodies`/`n_plastids` for anything
+involving fluorescence intensity or blob counts.
 
 ## Step 5: Ad hoc comparison / subset analyses
 
@@ -430,10 +605,16 @@ standalone scripts — worth formalizing before this becomes a "real" repo:
 | Morphological closing / opening radius | 10 px / 2 px | `quantify_cells.py` |
 | Min component area | 300 px² | `quantify_cells.py` |
 | Cell length / width / aspect ratio bounds | 15–40 µm / 2–7 µm / 5–16 | `quantify_cells.py` |
-| Min solidity | 0.75 | `quantify_cells.py` |
+| Min solidity | 0.75 (rescuable via `has_body_branch` — see Step 3) | `quantify_cells.py` |
+| Skeleton prune iterations / tip margin | 10 px / 20 px | `quantify_cells.py` |
 | Lipid body smoothing σ / min size | 1.0 px / 3 px | `quantify_cells.py` |
+| Lipid body watershed min distance / min prominence | 3 px / 0 (disabled) | `quantify_cells.py` |
+| Plastid smoothing σ / min size | 1.0 px / 3 px | `quantify_cells.py` |
+| Plastid watershed min distance / min prominence | 3 px / 0 (disabled — **not calibrated**, see Step 3) | `quantify_cells.py` |
+| Plastid min focus score | 580 | `quantify_cells.py` |
 | Dilation radius (rejected approach) | 15 px | `quantify_cells_dilated.py` |
-| Registration correction (dy, dx) | (7, -1) px | `quantify_cells_shifted.py` |
+| Registration correction (dy, dx) | (7, -1) px | `quantify_cells.py` (also used by `quantify_cells_shifted.py`) |
+| Skeleton-clustering cluster gap (prototype, not production) | 20 px (**untuned**) | `blob_counting_params_explorer_app.py` |
 
 ## Open items
 
@@ -445,17 +626,33 @@ standalone scripts — worth formalizing before this becomes a "real" repo:
    possible — e.g. a fiducial/bead calibration slide imaged in all 3
    channels would settle this properly, rather than relying on the DIC ↔
    chlorophyll structural correspondence as a proxy.
-3. `quantify_cells.py`'s own plotting only produces the lipid-body-count
-   plot; the average/total intensity plots currently live in
+3. `quantify_cells.py`'s own plotting only produces the lipid-body-count and
+   plastid-count plots; the average/total intensity plots currently live in
    `quantify_cells_shifted.py` and ad hoc snippets (Step 5). Consolidate into
    one script with a `--metric` flag.
 4. No automated tests exist. At minimum, snapshot-test
-   `segment_dic`/`accepted_cells`/`count_lipid_bodies` against a couple of
-   the QC-reviewed FOVs so future refactors don't silently change accepted
-   cell counts or measurements.
+   `segment_dic`/`accepted_cells`/`count_lipid_bodies`/`count_plastids`
+   against a couple of the QC-reviewed FOVs so future refactors don't
+   silently change accepted cell counts or measurements.
 5. `renamed_composites/` currently holds both the renamed per-FOV TIFFs and
    the composite QC PNGs — consider splitting these into separate
    directories for clarity.
+6. **Calibrate the Chlorophyll watershed parameters** (`PLASTID_WATERSHED_MIN_DISTANCE_PX`/
+   `PLASTID_WATERSHED_MIN_PROMINENCE`) — a systematic sweep over both
+   together (not either alone) against the two known validation cells (see
+   Step 3), to find a combination giving a biologically plausible
+   dividing-cell rate. Deferred at the user's request as of 2026-07-21; not
+   to be started unprompted — see `HANDOFF.md`.
+7. Decide whether to promote the skeleton-clustered plastid-splitting
+   prototype (Step 3, `blob_counting_params_explorer_app.py`) to production.
+   Needs: tuning `cluster_gap_px`, and checking the false-split risk on a
+   known single-plastid (non-dividing) cell, which hasn't been done yet.
+8. `quantify_cells.py`'s own `main()` computes `n_lipid_bodies`/`n_plastids`
+   from raw, unregistered fluorescence channels (see Step 3/4) — consider
+   whether it should apply `correct_fluorescence_registration` itself, or
+   whether `quantify_cells_shifted.py` should simply become the one script
+   that computes blob counts at all (avoiding two slightly different
+   `n_plastids`/`n_lipid_bodies` values per cell across the two CSVs).
 
 ## Quickstart: full pipeline from raw data
 
