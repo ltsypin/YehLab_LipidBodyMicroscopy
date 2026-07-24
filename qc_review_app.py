@@ -24,8 +24,12 @@ panels ("why did you select this?"), and "Export ROIs" writes everything
 an existing file to load back in, both at startup and whenever changed.
 
 Segmentation reuses quantify_cells.segment_dic/accepted_cells/
-count_lipid_bodies verbatim -- this app never re-implements or approximates
-the pipeline, so what you review here is exactly what the CSVs contain.
+count_lipid_bodies/compute_dic_background/correct_dic_background verbatim --
+this app never re-implements or approximates the pipeline, so what you
+review here is exactly what the CSVs contain. (Previously this app called
+segment_dic on the raw, uncorrected DIC image, so its cell population could
+disagree with quantify_cells.py's own main() wherever the fixed-pattern
+background correction matters -- fixed to apply the same correction first.)
 
 Run:
     bokeh serve --show qc_review_app.py --args <input_dir> [<output_dir>]
@@ -47,6 +51,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from quantify_cells import (
     CHANNELS, segment_dic, accepted_cells, count_lipid_bodies, LIPID_SMOOTH_SIGMA,
+    compute_dic_background, correct_dic_background,
 )
 from quantify_cells_shifted import SHIFT_DY, SHIFT_DX
 from composite_figure import (
@@ -89,11 +94,21 @@ GLOBAL_RANGES = compute_global_ranges(files_by_channel)
 for channel, (vmin, vmax) in GLOBAL_RANGES.items():
     print(f"  {channel}: min={vmin}, max={vmax}")
 
-fov_items = sorted(group_fovs(INPUT_DIR).items())
+all_fovs = group_fovs(INPUT_DIR)
+fov_items = sorted(all_fovs.items())
 fov_items = [(key, paths) for key, paths in fov_items if all(c in paths for c in CHANNELS)]
 if not fov_items:
     raise SystemExit(f"No complete FOVs (all 3 channels) found in {INPUT_DIR}")
 print(f"Found {len(fov_items)} complete FOVs.")
+
+# Same fixed-pattern background correction quantify_cells.py's own main() and
+# quantify_cells_shifted.py apply before segment_dic -- always estimated from every
+# DIC image in INPUT_DIR (not just the complete-triplet FOVs above), matching those
+# scripts exactly, since it's estimating a stationary instrument artifact, not
+# anything tied to which channels a given FOV happens to have.
+_dic_paths_for_background = [paths["DIC"] for paths in all_fovs.values() if "DIC" in paths]
+DIC_BACKGROUND = compute_dic_background(_dic_paths_for_background)
+print(f"Computed DIC background from {len(_dic_paths_for_background)} FOV(s) in {INPUT_DIR}")
 
 _cache = {}
 flagged_registry = {}      # (prefix, fov_num, cell_id) -> measurement dict (incl. "note")
@@ -129,7 +144,8 @@ def load_fov(idx):
     bod_corr_norm = normalize(bod_corr, *GLOBAL_RANGES["BODIPY"])
     reg_overlay_rgb = np.clip(to_rgb(chl_corr_norm, "magenta") + to_rgb(bod_corr_norm, "cyan"), 0.0, 1.0)
 
-    labeled, n_components = segment_dic(dic)
+    dic_corrected = correct_dic_background(dic, DIC_BACKGROUND)
+    labeled, n_components = segment_dic(dic_corrected)
     cells = list(accepted_cells(labeled, n_components, dic.shape))
     bod_smooth = ndi.gaussian_filter(bod, sigma=LIPID_SMOOTH_SIGMA)
 

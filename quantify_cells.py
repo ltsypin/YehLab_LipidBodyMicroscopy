@@ -150,15 +150,22 @@ SKELETON_TIP_MARGIN_PX = 20  # branch points within this geodesic distance of a 
 LIPID_SMOOTH_SIGMA = 1.0
 LIPID_MIN_SIZE_PX = 3
 LIPID_WATERSHED_MIN_DISTANCE_PX = 3
-LIPID_WATERSHED_MIN_PROMINENCE = 0  # disabled by default -- not yet explored, see project conversation
+LIPID_WATERSHED_MIN_PROMINENCE = 60  # calibrated -- see project conversation
 
 # Plastid counting (Chlorophyll channel) shares count_bright_blobs with lipid-body
-# counting, but has no calibrated precedent of its own yet -- these starting values
-# just mirror the lipid-body defaults (see project conversation).
+# counting, calibrated separately -- see project conversation. Uses the skeleton-
+# clustered method (method="skeleton" in count_plastids below): plain min_distance/
+# min_prominence couldn't satisfy both a dividing cell's two real close-together
+# plastids and a non-dividing plastid's own internal texture noise at once.
 PLASTID_SMOOTH_SIGMA = 1.0
 PLASTID_MIN_SIZE_PX = 3
 PLASTID_WATERSHED_MIN_DISTANCE_PX = 3
-PLASTID_WATERSHED_MIN_PROMINENCE = 0  # disabled by default -- not yet explored, see project conversation
+PLASTID_WATERSHED_MIN_PROMINENCE = 100  # calibrated -- see project conversation. Must stay
+# low enough that both known plastid-count validation cells' real peaks survive h_maxima
+# filtering before skeleton-clustering ever runs -- confirmed 0-100 keeps both correct,
+# 200+ prunes one of Arginine_Day3_rep3FOV4 cell 4's two real peaks down to 1 before
+# clustering can group anything, which clustering cannot then recover.
+PLASTID_SKELETON_CLUSTER_GAP_PX = 20  # inherited from the explorer-app prototype default, not independently re-tuned
 
 # Focus score: variance of the Laplacian of the raw, registration-corrected Chlorophyll
 # within a cell's mask -- a standard microscopy autofocus metric (in-focus structure has
@@ -360,7 +367,61 @@ def accepted_cells(labeled, n_components, image_shape):
         )
 
 
-def count_bright_blobs(channel_smooth, ys, xs, min_size_px, watershed_min_distance, watershed_min_prominence=0):
+def _project_peaks_onto_skeleton(peak_ys, peak_xs, skel, dist_a, y0, x0):
+    """For each peak (full-image coords), find the nearest pixel of `skel` (a cell's own
+    DIC-derived skeleton, in its own local frame offset by y0-1/x0-1) and return its
+    arc-length (dist_a, geodesic distance from tip A) and signed side (which side of the
+    local skeleton tangent it falls on, via cross product -- +1/-1, or 0 if too close to
+    a tip to estimate a tangent). Ported verbatim from
+    blob_counting_params_explorer_app.py's prototype of the same name."""
+    skel_ys, skel_xs = np.where(skel)
+    skel_arc = dist_a[skel_ys, skel_xs]
+    arc_lens, sides = [], []
+    for py, px in zip(peak_ys, peak_xs):
+        lpy, lpx = py - y0 + 1, px - x0 + 1
+        d2 = (skel_ys - lpy) ** 2 + (skel_xs - lpx) ** 2
+        i = int(np.argmin(d2))
+        nsy, nsx, arc_len = skel_ys[i], skel_xs[i], skel_arc[i]
+        before = np.where(np.abs(skel_arc - (arc_len - 4)) < 1.5)[0]
+        after = np.where(np.abs(skel_arc - (arc_len + 4)) < 1.5)[0]
+        if len(before) and len(after):
+            ta = (skel_ys[before[0]], skel_xs[before[0]])
+            tb = (skel_ys[after[0]], skel_xs[after[0]])
+            tangent = np.array([tb[0] - ta[0], tb[1] - ta[1]])
+            radial = np.array([lpy - nsy, lpx - nsx])
+            cross = tangent[0] * radial[1] - tangent[1] * radial[0]
+            side = float(np.sign(cross))
+        else:
+            side = 0.0
+        arc_lens.append(float(arc_len))
+        sides.append(side)
+    return np.array(arc_lens), np.array(sides)
+
+
+def _cluster_peaks_by_skeleton(peak_ys, peak_xs, skel, dist_a, y0, x0, cluster_gap_px):
+    """Group peaks into clusters: first by side (+1/-1/0 are each their own bucket), then
+    by arc-length proximity within a side -- a new cluster starts whenever the gap to the
+    previous peak (sorted by arc length) exceeds cluster_gap_px. Returns one cluster id
+    per peak. Ported verbatim from blob_counting_params_explorer_app.py's prototype of
+    the same name."""
+    if len(peak_ys) == 0:
+        return np.array([], dtype=int)
+    arc_lens, sides = _project_peaks_onto_skeleton(peak_ys, peak_xs, skel, dist_a, y0, x0)
+    order = np.lexsort((arc_lens, sides))
+    cluster_ids = np.zeros(len(peak_ys), dtype=int)
+    next_id = -1
+    prev_side, prev_arc = None, None
+    for idx in order:
+        side, arc = sides[idx], arc_lens[idx]
+        if prev_side is None or side != prev_side or abs(arc - prev_arc) > cluster_gap_px:
+            next_id += 1
+        cluster_ids[idx] = next_id
+        prev_side, prev_arc = side, arc
+    return cluster_ids
+
+
+def count_bright_blobs(channel_smooth, ys, xs, min_size_px, watershed_min_distance, watershed_min_prominence=0,
+                        method="watershed", cluster_gap_px=None):
     """Number of distinct bright blobs within a cell mask, in an already-smoothed
     fluorescence channel. Per-cell Otsu threshold (not a global one -- each cell gets
     its own bright/dim cutoff from its own pixels), then watershed-split at local
@@ -379,8 +440,19 @@ def count_bright_blobs(channel_smooth, ys, xs, min_size_px, watershed_min_distan
     (each has its own full-height peak with a genuinely deep valley between them --
     high prominence, stays split) from one blob with two lobes at slightly different
     focus/brightness (the dip between them never drops back to background -- low
-    prominence, gets merged). Disabled (0) by default -- not yet calibrated, see
-    project conversation."""
+    prominence, gets merged).
+
+    method="watershed" (default) uses one marker per raw peak, same as production has
+    always done for lipid bodies. method="skeleton" instead reuses the cell's own
+    DIC-derived skeleton (identical construction to has_body_branch's) to project every
+    raw peak onto a curvature-tolerant coordinate (arc-length along the cell's
+    centerline, and which side of it), then clusters peaks within cluster_gap_px of each
+    other on the same side into one watershed marker per CLUSTER instead of one per raw
+    peak -- see project conversation: no single min_distance/min_prominence value could
+    make a dividing cell's two real close-together plastids survive as 2 while a single
+    non-dividing plastid's own internal texture noise (which can produce several raw
+    sub-peaks of its own) still collapsed back to 1; clustering by position along the
+    cell's own centerline resolves both at once."""
     cell_mask = np.zeros(channel_smooth.shape, dtype=bool)
     cell_mask[ys, xs] = True
     thresh = otsu_threshold(channel_smooth[ys, xs])
@@ -394,8 +466,19 @@ def count_bright_blobs(channel_smooth, ys, xs, min_size_px, watershed_min_distan
     if len(coords) == 0:
         labeled, n = ndi.label(bright_mask, structure=np.ones((3, 3)))
     else:
+        peak_ys, peak_xs = coords[:, 0], coords[:, 1]
+        if method == "skeleton":
+            y0, x0 = int(ys.min()), int(xs.min())
+            local_mask = np.zeros((int(ys.max()) - y0 + 3, int(xs.max()) - x0 + 3), dtype=bool)
+            local_mask[ys - y0 + 1, xs - x0 + 1] = True
+            skel = prune_skeleton(skeletonize(local_mask), SKELETON_PRUNE_ITER)
+            dist_from_a, _dist_from_b = _find_tips(skel)
+            cluster_ids = _cluster_peaks_by_skeleton(peak_ys, peak_xs, skel, dist_from_a, y0, x0, cluster_gap_px)
+            marker_ids = cluster_ids + 1
+        else:
+            marker_ids = np.arange(1, len(coords) + 1)
         markers = np.zeros(channel_smooth.shape, dtype=int)
-        markers[coords[:, 0], coords[:, 1]] = np.arange(1, len(coords) + 1)
+        markers[peak_ys, peak_xs] = marker_ids
         labeled = watershed(-channel_smooth, markers=markers, mask=bright_mask, connectivity=2)
         n = int(labeled.max())
 
@@ -415,9 +498,12 @@ def count_plastids(chlorophyll_smooth, ys, xs):
     """Number of distinct Chlorophyll-bright plastids within a cell mask. P.
     tricornutum normally carries a single plastid that duplicates before the cell
     divides, so >1 here is a candidate marker for a dividing cell (not yet validated
-    against ground truth -- see project conversation)."""
+    against ground truth -- see project conversation). Uses the skeleton-clustered
+    method (see count_bright_blobs) -- promoted from prototype to production, see
+    project conversation."""
     return count_bright_blobs(chlorophyll_smooth, ys, xs, PLASTID_MIN_SIZE_PX, PLASTID_WATERSHED_MIN_DISTANCE_PX,
-                               PLASTID_WATERSHED_MIN_PROMINENCE)
+                               PLASTID_WATERSHED_MIN_PROMINENCE, method="skeleton",
+                               cluster_gap_px=PLASTID_SKELETON_CLUSTER_GAP_PX)
 
 
 def compute_focus_score(channel_img, ys, xs):
@@ -470,6 +556,29 @@ def filter_fovs_by_day_rep(fovs, days=None, reps=None):
     return filtered
 
 
+def load_flagged_cell_keys(csv_path):
+    """(sample, fov, cell_id) tuples to exclude from analysis, from a qc_review_app.py
+    hand-reviewed flagged-cells export (poor segmentation, out of focus, cell doublet,
+    etc -- see each row's own note). Returns an empty set if the file doesn't exist --
+    exclusion only happens once a reviewer has actually produced one."""
+    if not os.path.exists(csv_path):
+        return set()
+    df = pd.read_csv(csv_path)
+    return set(zip(df["sample"], df["fov"].astype(int), df["cell_id"].astype(int)))
+
+
+def exclude_flagged_cells(df, flagged_keys, source_description):
+    """Drop rows whose (sample, fov, cell_id) is in flagged_keys, preserving cell_id
+    numbering for the cells that remain (never renumbered) so it stays traceable back
+    to flagged_rois.csv/the QC overlays."""
+    if not flagged_keys:
+        return df
+    mask = [(s, f, c) in flagged_keys for s, f, c in zip(df["sample"], df["fov"], df["cell_id"])]
+    excluded = int(np.sum(mask))
+    print(f"Excluding {excluded} hand-flagged cell(s) (poor segmentation) per {source_description}")
+    return df[~np.array(mask)].reset_index(drop=True)
+
+
 def save_qc_overlay(dic_img, cells, out_path):
     fig, ax = plt.subplots(figsize=(8, 6))
     ax.imshow(dic_img, cmap="gray")
@@ -481,6 +590,39 @@ def save_qc_overlay(dic_img, cells, out_path):
     ax.axis("off")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def make_categorical_plot_by_replicate(df, value_col, ylabel, out_path):
+    """Same categorical-scatter style as make_categorical_plot (x = condition, black bar =
+    per-condition mean), but colors each point by its replicate number (parsed from the
+    sample prefix via parse_day_rep) instead of one flat color, so replicate-to-replicate
+    spread is visible directly rather than needing a separate --reps-filtered rerun."""
+    fig, ax = plt.subplots(figsize=(5, 5))
+    rng = np.random.default_rng(0)
+    df = df.copy()
+    df["replicate"] = df["sample"].apply(lambda s: parse_day_rep(s)[1])
+    reps = sorted(df["replicate"].dropna().unique())
+    cmap = plt.get_cmap("tab10")
+    rep_colors = {rep: cmap(i) for i, rep in enumerate(reps)}
+    for i, condition in enumerate(CONDITION_ORDER):
+        sub = df[df["condition"] == condition]
+        jitter = rng.uniform(-0.15, 0.15, size=len(sub))
+        for rep in reps:
+            rep_mask = (sub["replicate"] == rep).values
+            ax.scatter(np.full(rep_mask.sum(), i) + jitter[rep_mask], sub.loc[rep_mask, value_col],
+                       alpha=0.6, s=18, edgecolor="none", color=rep_colors[rep],
+                       label=f"rep{rep}" if i == 0 else None)
+        if len(sub):
+            ax.hlines(sub[value_col].mean(), i - 0.22, i + 0.22, color="black", linewidth=2)
+    ax.set_xticks(range(len(CONDITION_ORDER)))
+    ax.set_xticklabels(CONDITION_ORDER)
+    ax.set_ylabel(ylabel)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.legend(title="Replicate", frameon=False, fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=300)
     plt.close(fig)
 
 
@@ -575,6 +717,9 @@ def main():
             save_qc_overlay(dic_corrected, cells, os.path.join(qc_dir, f"{prefix}_FOV{fov_num}_qc.png"))
 
     df = pd.DataFrame(rows)
+    flagged_path = os.path.join(args.output_dir, "flagged_rois.csv")
+    df = exclude_flagged_cells(df, load_flagged_cell_keys(flagged_path), flagged_path)
+
     csv_path = os.path.join(args.output_dir, "cell_measurements.csv")
     df.to_csv(csv_path, index=False)
     print(f"\nSaved {len(df)} cell measurements to {csv_path}")

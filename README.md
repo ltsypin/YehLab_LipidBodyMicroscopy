@@ -41,6 +41,7 @@ qc_review_app.py             (interactive segmentation QC tool — see "QC revie
 segmentation_params_explorer_app.py    (interactive Step 3 segmentation tuning — see "Interactive parameter-exploration tools" below)
 blob_counting_params_explorer_app.py   (interactive lipid-body/plastid counting tuning — see "Interactive parameter-exploration tools" below)
 cell_params_review_app.py    (per-cell manual parameter estimation + notes — see "Per-cell parameter review tool" below)
+plot_by_replicate.py         (replicate-colored lipid-body/BODIPY/chlorophyll plots — see Step 5)
 ```
 
 Raw `.liff` files and their derived TIFF exports are grouped into a
@@ -267,30 +268,45 @@ ridge-flooding step, not peak detection by itself.)
 Two independent watershed knobs, both exposed per-channel:
 - `watershed_min_distance` (px) — purely spatial non-max-suppression radius;
   two peaks closer than this always collapse to one. `LIPID_WATERSHED_MIN_DISTANCE_PX = 3`
-  is a confirmed-reasonable default for BODIPY.
-- `watershed_min_prominence` (intensity units, disabled/0 by default) — a
-  complementary, purely topographic criterion via `skimage.morphology.h_maxima`:
-  a peak only survives if there's no path to an equal-or-higher peak along
-  which the intensity drop is smaller than this value. This is what
-  distinguishes two real neighboring blobs (each has its own full-height
-  peak with a genuinely deep valley between them) from one blob with two
-  lobes at slightly different focus/brightness (the dip between them never
-  drops back to background).
+  is a confirmed-reasonable default for BODIPY, as is `PLASTID_WATERSHED_MIN_DISTANCE_PX = 3`
+  for Chlorophyll.
+- `watershed_min_prominence` (intensity units) — a complementary, purely
+  topographic criterion via `skimage.morphology.h_maxima`: a peak only
+  survives if there's no path to an equal-or-higher peak along which the
+  intensity drop is smaller than this value. This is what distinguishes two
+  real neighboring blobs (each has its own full-height peak with a
+  genuinely deep valley between them) from one blob with two lobes at
+  slightly different focus/brightness (the dip between them never drops
+  back to background). Calibrated: `LIPID_WATERSHED_MIN_PROMINENCE = 60`,
+  `PLASTID_WATERSHED_MIN_PROMINENCE = 100`.
 
-**Plastid counting is NOT yet calibrated.** At the current defaults
-(`min_distance=3`, `min_prominence=0`, mirroring BODIPY), >1 plastid is
-detected in ~91% of cells (190 of 209) — not biologically plausible for *P.
-tricornutum*, which normally carries one plastid that duplicates only near
-the end of division (the intended use of `n_plastids` is as a candidate
-dividing-cell marker). A systematic sweep of `sigma`/`min_distance` and of
-`threshold_mult`+`min_prominence` together showed this isn't a matter of
-finding one missed value: no single global-parameter combination satisfies
-two known validation cells at once (`Arginine_Day3_rep2FOV2` cell 2, two
-real close-together plastids, needs `min_distance` around 8; and
-`Arginine_Day3_rep3FOV4` cell 4, a dividing cell near the end of cytokinesis
-whose two plastids should be symmetric about the cell's long axis, breaks
-under every parameter value that fixes the first case). See "Open items"
-and the skeleton-clustering prototype below.
+**Plastid counting now uses the skeleton-clustered method** (promoted from
+prototype, see below), calibrated against two known validation cells:
+`Arginine_Day3_rep2FOV2` cell 2 (two real close-together plastids) and
+`Arginine_Day3_rep3FOV4` cell 4 (a dividing cell near the end of cytokinesis
+whose two plastids should be symmetric about the cell's long axis). At the
+original defaults (plain watershed, `min_distance=3`, `min_prominence=0`,
+mirroring BODIPY), >1 plastid was detected in ~91% of cells (190 of 209) —
+not biologically plausible for *P. tricornutum*, which normally carries one
+plastid that duplicates only near the end of division. A systematic sweep of
+`sigma`/`min_distance` and of `threshold_mult`+`min_prominence` together
+showed this wasn't a matter of finding one missed value: no single
+global-parameter combination with *plain* watershed satisfied both
+validation cells at once (the first needs `min_distance` around 8; the
+second breaks under every value that fixes the first). The skeleton-clustered
+method (below) resolves both simultaneously.
+
+**`watershed_min_prominence` and skeleton-clustering interact — keep
+prominence low enough that both peaks survive to be clustered.** `h_maxima`
+prominence filtering runs *before* peak clustering, so if it's set too high
+it can prune a real peak down to nothing before clustering ever sees it,
+and clustering cannot recover a peak that no longer exists. Confirmed on
+`Arginine_Day3_rep3FOV4` cell 4: at `min_prominence` 0–100 both of its real
+peaks survive and correctly cluster into `n_plastids=2`; at 200+, `h_maxima`
+prunes one of the two peaks first and the cell reads `n_plastids=1`
+regardless of clustering. `PLASTID_WATERSHED_MIN_PROMINENCE = 100` was
+chosen with this margin in mind — don't raise it without re-checking both
+validation cells.
 
 **Chlorophyll focus score** (`compute_focus_score`, `chlorophyll_focus_score`
 column): variance of the Laplacian of the *raw* (unsmoothed) Chlorophyll
@@ -337,6 +353,20 @@ Default plots: `lipid_bodies_per_cell.png` and `plastids_per_cell.png`
 (the fixed-pattern background map itself). Average/total-intensity plots are
 *not* produced by this script's `main()` by default — see Step 5.
 
+**Hand-flagged cell exclusion**: if `<output_dir>/flagged_rois.csv` exists
+(produced by `qc_review_app.py`, see below), both this script and
+`quantify_cells_shifted.py` automatically drop every `(sample, fov, cell_id)`
+it lists — poor segmentation, out of focus, cell doublets, etc, per each
+row's own note — from `cell_measurements.csv`/`cell_measurements_shift_corrected.csv`
+and all derived plots, before anything is saved (`load_flagged_cell_keys`/
+`exclude_flagged_cells` in `quantify_cells.py`). Excluded cell_ids are never
+renumbered — a gap just means that cell was hand-excluded, keeping the
+mapping back to `flagged_rois.csv`/the QC overlays traceable. This is
+automatic and silent about *why* a given cell was flagged (see the note
+column in `flagged_rois.csv` itself for that) but prints how many cells it
+excluded. If the file doesn't exist, nothing is excluded — this only
+activates once a reviewer has actually produced one.
+
 ### Interactive parameter-exploration tools
 
 Two Bokeh apps let you tune segmentation/counting parameters live against
@@ -368,23 +398,31 @@ Also registered in `~/ClaudeCowork/.claude/launch.json` as
   and (skeleton method only) cluster gap. Cell crops auto-rotate (cosmetic
   only, `np.rot90`) so each cell's longer side always displays vertically.
 
-**Prototype, not in production: skeleton-clustered plastid splitting.**
-Neither `min_distance` nor `min_prominence` alone could satisfy both known
-plastid-counting validation cases above. This prototype (in
-`blob_counting_params_explorer_app.py` only, method toggle "Watershed,
-skeleton-clustered") instead reuses the cell's own DIC-derived skeleton
-(identical construction to `has_body_branch`'s) to project every raw
-intensity peak onto a curvature-tolerant coordinate — arc-length along the
-cell's centerline, and which side of it — then clusters peaks by (side,
-arc-length gap ≤ `cluster_gap_px`, default 20px, **untuned**) into one
-watershed marker per cluster instead of one per raw peak. This succeeded on
-both known validation cells where every global-parameter combination failed
-above, because unlike a straight-line long-axis split it tolerates cell
-curvature. **Not yet adopted** into `count_bright_blobs`/`count_plastids`:
-whether a single non-dividing plastid's own internal texture noise could
-land peaks on both skeleton sides and cause a false split has not been
-checked against any known single-plastid cell — decide with the user before
-promoting this to production.
+**Skeleton-clustered plastid splitting — promoted to production.** Neither
+`min_distance` nor `min_prominence` alone could satisfy both known
+plastid-counting validation cases above. This method (originally prototyped
+in `blob_counting_params_explorer_app.py`, method toggle "Watershed,
+skeleton-clustered") reuses the cell's own DIC-derived skeleton (identical
+construction to `has_body_branch`'s) to project every raw intensity peak
+onto a curvature-tolerant coordinate — arc-length along the cell's
+centerline, and which side of it — then clusters peaks by (side, arc-length
+gap ≤ `cluster_gap_px`) into one watershed marker per cluster instead of one
+per raw peak. This succeeds on both known validation cells where every
+global-parameter combination with plain watershed failed, because unlike a
+straight-line long-axis split it tolerates cell curvature.
+
+Promoted into `quantify_cells.py`'s own `count_bright_blobs`/`count_plastids`
+(`method="skeleton"` — `_project_peaks_onto_skeleton`/
+`_cluster_peaks_by_skeleton`, ported verbatim from the explorer-app
+prototype) as of this calibration. `count_lipid_bodies`/BODIPY still uses
+plain watershed (`method="watershed"`, the default) — only Chlorophyll/plastid
+counting uses skeleton-clustering. `PLASTID_SKELETON_CLUSTER_GAP_PX = 20` is
+inherited from the prototype's own default and has not been independently
+re-tuned. The originally-flagged open risk — whether a single non-dividing
+plastid's own internal texture noise could land peaks on both skeleton sides
+and cause a false split — has not been exhaustively checked against a large
+sample of known single-plastid cells, only the two validation cells above;
+watch `n_plastids` for implausible results as more data comes in.
 
 ### QC review tool (`qc_review_app.py`)
 
@@ -392,7 +430,10 @@ promoting this to production.
 is an interactive Bokeh server app for browsing the whole dataset's
 segmentation FOV-by-FOV and flagging specific cells as poorly segmented, to
 build up a concrete list of failure cases (e.g. for choosing/validating
-automated-test fixtures, see the open items below).
+automated-test fixtures, see the open items below). Its `flagged_rois.csv`
+export feeds directly back into `quantify_cells.py`/`quantify_cells_shifted.py`
+(see "Hand-flagged cell exclusion" in Step 3) — flagging a cell here excludes
+it from the actual analysis, not just from this review UI.
 
 ```
 bokeh serve --show qc_review_app.py --args <input_dir> [<output_dir>]
@@ -452,8 +493,13 @@ across channels.
   at a colleague's export, picks up right where that file left off.
 
 This tool calls `quantify_cells.segment_dic`/`accepted_cells`/
-`count_lipid_bodies` directly, so what it shows is exactly what ends up in
-`cell_measurements.csv` — not an approximation of it.
+`count_lipid_bodies`/`compute_dic_background`/`correct_dic_background`
+directly, so what it shows is exactly what ends up in `cell_measurements.csv`
+— not an approximation of it. (This app used to call `segment_dic` on the
+raw, uncorrected DIC image, so its cell population could silently disagree
+with `quantify_cells.py`'s own `main()` wherever the fixed-pattern background
+correction mattered — fixed to apply the same correction first, same as
+`quantify_cells_shifted.py`.)
 
 ### Per-cell parameter review tool (`cell_params_review_app.py`)
 
@@ -646,6 +692,16 @@ involving fluorescence intensity or blob counts.
 These were done as one-off snippets against the CSVs above rather than as
 standalone scripts — worth formalizing before this becomes a "real" repo:
 
+- **Replicate-colored plots** (`plot_by_replicate.py`, a real standalone
+  script, not an ad hoc snippet): `n_lipid_bodies`, `avg_bodipy`, and
+  `avg_chlorophyll` per cell, split by condition (same categorical-scatter
+  style as `make_categorical_plot`) with each point additionally colored by
+  replicate number (`make_categorical_plot_by_replicate`, `quantify_cells.py`).
+  Reads `cell_measurements_shift_corrected.csv` — the recommended pipeline
+  for both fluorescence intensity and blob counts (see Step 4) — so
+  hand-flagged cells are already excluded. Run:
+  `python plot_by_replicate.py [<csv_path>] [<output_dir>]` (defaults to
+  `quantification/cell_measurements_shift_corrected.csv` and `quantification/`).
 - **Total (not average) fluorescence per cell**: same categorical-scatter
   style, using the `total_chlorophyll`/`total_bodipy` columns already present
   in the CSVs (`chlorophyll_total_per_cell.png`, `bodipy_total_per_cell.png`).
@@ -660,6 +716,17 @@ standalone scripts — worth formalizing before this becomes a "real" repo:
   recompute its normalization baseline over just that subset. Restricting to
   reps 1–2 conveniently also excludes the two known merged-cell artifacts
   from Step 3, since both are in rep 3. Suffix such outputs `_rep<N>-<M>`.
+- **`quantification_reps1-2/`** (2026-07-24): rep 3 was identified as an
+  outlier relative to reps 1–2 across all three nitrogen conditions (visible
+  in the replicate-colored plots above), so this directory holds a
+  self-contained reps-1,2-only analysis — `composite_figure.py`,
+  `quantify_cells.py`, and `quantify_cells_shifted.py` all re-run with
+  `--reps 1,2` (own normalization baseline, own DIC segmentation/measurements),
+  plus `plot_by_replicate.py`'s three plots recomputed from that subset. The
+  full-dataset (reps 1–3) results in `quantification/` are untouched.
+  `flagged_rois.csv` was copied (not moved) into this directory first, since
+  `exclude_flagged_cells` looks for it in `output_dir` and the same
+  hand-reviewed exclusions apply regardless of which reps subset is analyzed.
 - **Visual mask/registration comparisons** (`quantification/mask_comparison/`):
   tight-vs-dilated mask overlays, and before/after registration-correction
   overlays, generated by small scripts reusing
@@ -684,13 +751,14 @@ standalone scripts — worth formalizing before this becomes a "real" repo:
 | Min solidity | 0.75 (rescuable via `has_body_branch` — see Step 3) | `quantify_cells.py` |
 | Skeleton prune iterations / tip margin | 10 px / 20 px | `quantify_cells.py` |
 | Lipid body smoothing σ / min size | 1.0 px / 3 px | `quantify_cells.py` |
-| Lipid body watershed min distance / min prominence | 3 px / 0 (disabled) | `quantify_cells.py` |
+| Lipid body watershed min distance / min prominence | 3 px / 60 | `quantify_cells.py` |
 | Plastid smoothing σ / min size | 1.0 px / 3 px | `quantify_cells.py` |
-| Plastid watershed min distance / min prominence | 3 px / 0 (disabled — **not calibrated**, see Step 3) | `quantify_cells.py` |
+| Plastid watershed min distance / min prominence | 3 px / 100 (see prominence/clustering interaction note, Step 3) | `quantify_cells.py` |
+| Plastid counting method | skeleton-clustered (`count_plastids`, promoted from prototype) | `quantify_cells.py` |
 | Plastid min focus score | 580 | `quantify_cells.py` |
 | Dilation radius (rejected approach) | 15 px | `quantify_cells_dilated.py` |
 | Registration correction (dy, dx) | (7, -1) px | `quantify_cells.py` (also used by `quantify_cells_shifted.py`) |
-| Skeleton-clustering cluster gap (prototype, not production) | 20 px (**untuned**) | `blob_counting_params_explorer_app.py` |
+| Skeleton-clustering cluster gap | 20 px (inherited from prototype default, **not independently re-tuned**) | `quantify_cells.py` |
 
 ## Open items
 
@@ -713,16 +781,16 @@ standalone scripts — worth formalizing before this becomes a "real" repo:
 5. `renamed_composites/` currently holds both the renamed per-FOV TIFFs and
    the composite QC PNGs — consider splitting these into separate
    directories for clarity.
-6. **Calibrate the Chlorophyll watershed parameters** (`PLASTID_WATERSHED_MIN_DISTANCE_PX`/
-   `PLASTID_WATERSHED_MIN_PROMINENCE`) — a systematic sweep over both
-   together (not either alone) against the two known validation cells (see
-   Step 3), to find a combination giving a biologically plausible
-   dividing-cell rate. Deferred at the user's request as of 2026-07-21; not
-   to be started unprompted — see `HANDOFF.md`.
-7. Decide whether to promote the skeleton-clustered plastid-splitting
-   prototype (Step 3, `blob_counting_params_explorer_app.py`) to production.
-   Needs: tuning `cluster_gap_px`, and checking the false-split risk on a
-   known single-plastid (non-dividing) cell, which hasn't been done yet.
+6. ~~Calibrate the Chlorophyll watershed parameters~~ — **done** as of
+   2026-07-23: `PLASTID_WATERSHED_MIN_PROMINENCE=100` with the
+   skeleton-clustered method satisfies both known validation cells (see
+   Step 3). Still open: this hasn't been checked against a large sample of
+   known single-plastid (non-dividing) cells for false splits, only the two
+   validation cells — watch `n_plastids` for implausible dataset-wide rates.
+7. ~~Decide whether to promote the skeleton-clustered plastid-splitting
+   prototype to production~~ — **done** as of 2026-07-23, see Step 3.
+   `cluster_gap_px=20` is still just inherited from the prototype default,
+   not independently re-tuned.
 8. `quantify_cells.py`'s own `main()` computes `n_lipid_bodies`/`n_plastids`
    from raw, unregistered fluorescence channels (see Step 3/4) — consider
    whether it should apply `correct_fluorescence_registration` itself, or

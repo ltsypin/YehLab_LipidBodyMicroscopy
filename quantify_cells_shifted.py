@@ -64,6 +64,7 @@ from quantify_cells import (
     LIPID_SMOOTH_SIGMA, PLASTID_SMOOTH_SIGMA, PLASTID_MIN_FOCUS_SCORE,
     FLUORESCENCE_SHIFT_DY_PX, FLUORESCENCE_SHIFT_DX_PX,
     CONDITION_ORDER, make_categorical_plot, parse_int_list, filter_fovs_by_day_rep,
+    load_flagged_cell_keys, exclude_flagged_cells,
 )
 
 import matplotlib.pyplot as plt  # after quantify_cells import -- that's where matplotlib.use("Agg") happens
@@ -138,6 +139,9 @@ def main():
             ))
 
     df = pd.DataFrame(rows)
+    flagged_path = os.path.join(args.output_dir, "flagged_rois.csv")
+    df = exclude_flagged_cells(df, load_flagged_cell_keys(flagged_path), flagged_path)
+
     csv_path = os.path.join(args.output_dir, "cell_measurements_shift_corrected.csv")
     df.to_csv(csv_path, index=False)
     print(f"Saved {len(df)} cell measurements (shift=({args.shift_dy},{args.shift_dx})) to {csv_path}")
